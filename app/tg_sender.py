@@ -1,6 +1,8 @@
 import asyncio
+import contextvars
 import io
 import logging
+import math
 
 from telegram import Bot, InputFile
 from telegram.constants import ParseMode
@@ -34,6 +36,7 @@ class TelegramSender:
         self._chat_id = chat_id
         self._topics = topic_store
         self._topic_lock = asyncio.Lock()
+        self.require_success = contextvars.ContextVar("require_telegram_success", default=False)
 
     @property
     def bot(self) -> Bot:
@@ -109,7 +112,9 @@ class TelegramSender:
             return text[: TG_CAPTION_MAX - 20] + "\n\n[...усечено]"
         return text
 
-    async def _retry(self, coro_factory):
+    async def _retry(self, coro_factory, strict: bool | None = None):
+        if strict is None:
+            strict = self.require_success.get()
         for attempt in range(1, MAX_RETRIES + 1):
             try:
                 return await coro_factory()
@@ -122,8 +127,10 @@ class TelegramSender:
             except Exception:
                 log.exception("Failed to send to Telegram (attempt %d/%d)", attempt, MAX_RETRIES)
                 if attempt == MAX_RETRIES:
-                    return None
+                    break
                 await asyncio.sleep(2 * attempt)
+        if strict:
+            raise RuntimeError("Telegram delivery failed after retries")
         return None
 
     # ── send methods ───────────────────────────────────────────────
@@ -183,6 +190,22 @@ class TelegramSender:
             )
         )
 
+    async def send_video_note(self, data: bytes, duration: int | None = None,
+                              length: int | None = None,
+                              message_thread_id: int | None = None) -> bool:
+        """Send a MAX round video as a native Telegram video note."""
+        seconds = max(1, math.ceil(duration / 1000)) if duration else None
+        result = await self._retry(
+            lambda: self._bot.send_video_note(
+                chat_id=self._chat_id,
+                video_note=InputFile(io.BytesIO(data), filename="video_note.mp4"),
+                duration=seconds,
+                length=length,
+                message_thread_id=message_thread_id,
+            ), strict=False
+        )
+        return result is not None
+
     async def send_voice(self, data: bytes, caption: str = "",
                          message_thread_id: int | None = None) -> None:
         caption = self._truncate_caption(caption)
@@ -193,14 +216,14 @@ class TelegramSender:
                 caption=caption or None,
                 parse_mode=ParseMode.HTML,
                 message_thread_id=message_thread_id,
-            )
+            ), strict=False
         )
         if result is None:
             log.info("send_voice failed, falling back to send_audio")
             await self._retry(
                 lambda: self._bot.send_audio(
                     chat_id=self._chat_id,
-                    audio=InputFile(io.BytesIO(data), filename="audio.m4a"),
+                    audio=InputFile(io.BytesIO(data), filename="audio.ogg"),
                     caption=caption or None,
                     parse_mode=ParseMode.HTML,
                     message_thread_id=message_thread_id,

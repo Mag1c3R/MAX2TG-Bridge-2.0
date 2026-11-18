@@ -10,6 +10,8 @@ from telegram import Update
 
 from app.config import load_settings
 from app.max_listener import create_max_client
+from app.read_receipts import ReadReceiptStore
+from app.recovery import RecoveryStore
 from app.tg_handler import build_tg_app
 from app.tg_sender import TelegramSender
 from app.topics import TopicStore
@@ -73,21 +75,28 @@ async def main():
 
     os.makedirs(settings.state_dir, exist_ok=True)
     topic_store = TopicStore(os.path.join(settings.state_dir, "topics.json"))
+    read_receipts = ReadReceiptStore(
+        os.path.join(settings.state_dir, "read_receipts.json")
+    )
+    recovery = RecoveryStore(os.path.join(settings.state_dir, "recovery.sqlite3"))
 
     sender = TelegramSender(settings.tg_bot_token, settings.tg_chat_id, topic_store,
                             proxy_url=settings.tg_proxy)
     await sender.start()
 
     client = create_max_client(
-        settings.max_token, settings.max_device_id, sender, settings.max_chat_ids,
+        settings.max_token, settings.max_device_id, sender, settings.max_chat_ids, settings.max_exclude_chat_ids,
         debug=settings.debug,
+        read_receipts=read_receipts,
+        recovery=recovery,
     )
 
     tg_app = None
     if settings.reply_enabled:
         tg_app = build_tg_app(settings.tg_bot_token, client, settings.tg_chat_id,
                               topic_store, allowed_user_id=settings.tg_allowed_user_id,
-                              proxy_url=settings.tg_proxy)
+                              proxy_url=settings.tg_proxy,
+                              read_receipts=read_receipts)
         await tg_app.initialize()
         await tg_app.start()
         await tg_app.updater.start_polling(

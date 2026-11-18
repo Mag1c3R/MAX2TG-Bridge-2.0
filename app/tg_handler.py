@@ -16,6 +16,7 @@ from telegram.ext import (
 )
 
 from app.max_client import MaxClient
+from app.read_receipts import ReadReceiptStore
 from app.topics import TopicStore
 
 log = logging.getLogger(__name__)
@@ -24,6 +25,7 @@ MAX_CLIENT_KEY = "max_client"
 TOPIC_STORE_KEY = "topic_store"
 ALLOWED_USER_KEY = "allowed_user_id"
 SUPERGROUP_KEY = "supergroup_id"
+READ_RECEIPTS_KEY = "read_receipts"
 
 _MAX_URL_RE = re.compile(r"https?://(?:web\.)?max\.ru/(-?\d+)")
 
@@ -98,7 +100,10 @@ def _parse_max_chat_id(s: str) -> int | None:
 def _peer_id_in_dm(resolver, chat_id) -> int | None:
     """Return the other participant of a DIALOG chat (i.e., not us)."""
     chat = resolver.chats_raw.get(chat_id) or {}
-    my_id = resolver.my_id
+    try:
+        my_id = int(resolver.my_id)
+    except (TypeError, ValueError):
+        return None
     for uid_str in chat.get("participants") or {}:
         try:
             uid = int(uid_str)
@@ -129,21 +134,69 @@ def _resolve_topic_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return message, max_chat_id, max_client
 
 
+async def _report_send_failure(message, warning: str) -> None:
+    """Mark a failed or unconfirmed outgoing message and explain the error."""
+    try:
+        await message.set_reaction("👎")
+    except Exception:
+        log.warning("Could not mark a failed Telegram message", exc_info=True)
+    await message.reply_text(warning)
+
+
 async def _surface_send_result(message, resp) -> None:
-    """Translate a Max send_message response into a Telegram reaction or warning."""
+    """Report MAX send failures; a confirmed send needs no reaction."""
     err = (resp or {}).get("_max_error")
     if err:
         desc = (err.get("localizedMessage") or err.get("message")
                 or err.get("error") or "не удалось отправить сообщение")
-        await message.reply_text(f"⚠️ MAX: {desc}")
+        await _report_send_failure(message, f"⚠️ MAX: {desc}")
         return
     if not resp:
-        await message.reply_text("⚠️ Таймаут от MAX — сообщение не подтверждено.")
+        await _report_send_failure(message, "⚠️ Таймаут от MAX — сообщение не подтверждено.")
+
+
+async def _dm_peer_for_chat(max_client: MaxClient, chat_id: int) -> int | None:
+    """Verify that a MAX chat is a DM and identify its other participant."""
+    resolver = getattr(max_client, "resolver", None)
+    if resolver is None:
+        return None
+    chat_id = int(chat_id)
+    if chat_id not in resolver.chat_types or (
+        resolver.is_dm(chat_id) and _peer_id_in_dm(resolver, chat_id) is None
+    ):
+        try:
+            response = await max_client.cmd(48, {"chatIds": [chat_id]})
+            for chat in response.get("chats", []):
+                if int(chat.get("id", 0)) == chat_id:
+                    resolver.chat_types[chat_id] = chat.get("type")
+                    resolver.chats_raw[chat_id] = chat
+                    break
+        except (AttributeError, TypeError, ValueError):
+            log.warning("Could not identify MAX chat type for read receipts")
+            return None
+    return _peer_id_in_dm(resolver, chat_id) if resolver.is_dm(chat_id) else None
+
+
+async def _track_dm_send(message, resp, max_chat_id, max_client, context) -> None:
+    """Link one successful Telegram → MAX send to a future peer read mark."""
+    store: ReadReceiptStore | None = context.bot_data.get(READ_RECEIPTS_KEY)
+    if store is None or not resp or "_max_error" in resp:
+        return
+    sent = resp.get("message")
+    if not isinstance(sent, dict):
         return
     try:
-        await message.set_reaction("👀")
+        max_time = int(sent["time"])
+        peer_id = await _dm_peer_for_chat(max_client, int(max_chat_id))
+        if peer_id is None:
+            return
+        already_read = store.add(max_chat_id, peer_id, max_time, message.message_id)
+        if already_read:
+            await message.set_reaction("👀")
+            store.acknowledge(max_chat_id, message.message_id)
     except Exception:
-        log.debug("Could not set reaction on confirmed message", exc_info=True)
+        # A read receipt must never turn a successful send into an error.
+        log.warning("Could not track a MAX read receipt", exc_info=True)
 
 
 async def _on_topic_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -156,7 +209,7 @@ async def _on_topic_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
 
     if not max_client:
-        await message.reply_text("⚠️ Max клиент не подключён.")
+        await _report_send_failure(message, "⚠️ Max клиент не подключён.")
         return
 
     elements = _entities_to_max_elements(message.text, message.entities)
@@ -165,10 +218,11 @@ async def _on_topic_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
                                               elements=elements)
     except Exception:
         log.exception("Failed to send reply to Max chat %s", max_chat_id)
-        await message.reply_text("⚠️ Ошибка при отправке в Max.")
+        await _report_send_failure(message, "⚠️ Ошибка при отправке в Max.")
         return
 
     await _surface_send_result(message, resp)
+    await _track_dm_send(message, resp, max_chat_id, max_client, context)
 
 
 async def _download_tg_file(file_obj) -> bytes | None:
@@ -191,72 +245,77 @@ async def _on_topic_media(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     message, max_chat_id, max_client = target
 
     if not max_client:
-        await message.reply_text("⚠️ Max клиент не подключён.")
+        await _report_send_failure(message, "⚠️ Max клиент не подключён.")
         return
 
     caption = message.caption or ""
 
     # ── pick the right uploader for the attached media ────────────
     attach = None
-    if message.photo:
-        # message.photo is a list of progressively larger PhotoSize objects;
-        # the last one is the highest resolution.
-        photo = message.photo[-1]
-        data = await _download_tg_file(photo)
-        if data is None:
-            await message.reply_text("⚠️ Не удалось скачать фото из Telegram.")
-            return
-        attach = await max_client.upload_photo(data, chat_id=max_chat_id)
+    try:
+        if message.photo:
+            # message.photo is a list of progressively larger PhotoSize objects;
+            # the last one is the highest resolution.
+            photo = message.photo[-1]
+            data = await _download_tg_file(photo)
+            if data is None:
+                await _report_send_failure(message, "⚠️ Не удалось скачать фото из Telegram.")
+                return
+            attach = await max_client.upload_photo(data, chat_id=max_chat_id)
 
-    elif message.voice:
-        data = await _download_tg_file(message.voice)
-        if data is None:
-            await message.reply_text("⚠️ Не удалось скачать голосовое из Telegram.")
-            return
-        attach = await max_client.upload_audio(
-            data, chat_id=max_chat_id,
-            filename="voice.ogg",
-            mimetype="audio/ogg",
-        )
+        elif message.voice:
+            data = await _download_tg_file(message.voice)
+            if data is None:
+                await _report_send_failure(message, "⚠️ Не удалось скачать голосовое из Telegram.")
+                return
+            attach = await max_client.upload_audio(
+                data, chat_id=max_chat_id,
+                filename="voice.ogg",
+                mimetype="audio/ogg",
+            )
 
-    elif message.audio:
-        data = await _download_tg_file(message.audio)
-        if data is None:
-            await message.reply_text("⚠️ Не удалось скачать аудио из Telegram.")
-            return
-        attach = await max_client.upload_file(
-            data, chat_id=max_chat_id,
-            filename=message.audio.file_name or "audio",
-            mimetype=message.audio.mime_type or "audio/mpeg",
-        )
+        elif message.audio:
+            data = await _download_tg_file(message.audio)
+            if data is None:
+                await _report_send_failure(message, "⚠️ Не удалось скачать аудио из Telegram.")
+                return
+            attach = await max_client.upload_file(
+                data, chat_id=max_chat_id,
+                filename=message.audio.file_name or "audio",
+                mimetype=message.audio.mime_type or "audio/mpeg",
+            )
 
-    elif message.document:
-        data = await _download_tg_file(message.document)
-        if data is None:
-            await message.reply_text("⚠️ Не удалось скачать файл из Telegram.")
-            return
-        attach = await max_client.upload_file(
-            data, chat_id=max_chat_id,
-            filename=message.document.file_name or "file",
-            mimetype=message.document.mime_type or "application/octet-stream",
-        )
+        elif message.document:
+            data = await _download_tg_file(message.document)
+            if data is None:
+                await _report_send_failure(message, "⚠️ Не удалось скачать файл из Telegram.")
+                return
+            attach = await max_client.upload_file(
+                data, chat_id=max_chat_id,
+                filename=message.document.file_name or "file",
+                mimetype=message.document.mime_type or "application/octet-stream",
+            )
 
-    elif message.video:
-        data = await _download_tg_file(message.video)
-        if data is None:
-            await message.reply_text("⚠️ Не удалось скачать видео из Telegram.")
-            return
-        attach = await max_client.upload_file(
-            data, chat_id=max_chat_id,
-            filename=message.video.file_name or "video.mp4",
-            mimetype=message.video.mime_type or "video/mp4",
-        )
+        elif message.video:
+            data = await _download_tg_file(message.video)
+            if data is None:
+                await _report_send_failure(message, "⚠️ Не удалось скачать видео из Telegram.")
+                return
+            attach = await max_client.upload_file(
+                data, chat_id=max_chat_id,
+                filename=message.video.file_name or "video.mp4",
+                mimetype=message.video.mime_type or "video/mp4",
+            )
 
-    else:
-        return  # unsupported media kind
+        else:
+            return  # unsupported media kind
+    except Exception:
+        log.exception("Failed to upload media to Max chat %s", max_chat_id)
+        await _report_send_failure(message, "⚠️ Ошибка при загрузке файла в Max.")
+        return
 
     if not attach:
-        await message.reply_text("⚠️ Не удалось загрузить файл в MAX.")
+        await _report_send_failure(message, "⚠️ Не удалось загрузить файл в MAX.")
         return
 
     elements = _entities_to_max_elements(caption, message.caption_entities)
@@ -266,10 +325,11 @@ async def _on_topic_media(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                                               attaches=[attach])
     except Exception:
         log.exception("Failed to send media reply to Max chat %s", max_chat_id)
-        await message.reply_text("⚠️ Ошибка при отправке в Max.")
+        await _report_send_failure(message, "⚠️ Ошибка при отправке в Max.")
         return
 
     await _surface_send_result(message, resp)
+    await _track_dm_send(message, resp, max_chat_id, max_client, context)
 
 
 async def post_topic_intro(bot, supergroup_id, max_client: MaxClient,
@@ -898,7 +958,8 @@ async def _cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 def build_tg_app(token: str, max_client: MaxClient, supergroup_id: str,
                  topic_store: TopicStore, allowed_user_id: int | None = None,
-                 proxy_url: str | None = None) -> Application:
+                 proxy_url: str | None = None,
+                 read_receipts: ReadReceiptStore | None = None) -> Application:
     """Build the Telegram Application that routes topic replies back to Max."""
     builder = Application.builder().token(token)
     if proxy_url:
@@ -908,6 +969,7 @@ def build_tg_app(token: str, max_client: MaxClient, supergroup_id: str,
     app.bot_data[TOPIC_STORE_KEY] = topic_store
     app.bot_data[ALLOWED_USER_KEY] = int(allowed_user_id) if allowed_user_id else None
     app.bot_data[SUPERGROUP_KEY] = int(supergroup_id)
+    app.bot_data[READ_RECEIPTS_KEY] = read_receipts
 
     chat_filter = filters.Chat(chat_id=int(supergroup_id))
     app.add_handler(CommandHandler("bind", _cmd_bind, filters=chat_filter))

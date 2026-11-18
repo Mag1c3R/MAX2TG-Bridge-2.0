@@ -1,9 +1,12 @@
 import asyncio
 import logging
+import time
 from datetime import datetime
 from html import escape
 
 from app.max_client import MaxClient, MaxMessage
+from app.read_receipts import ReadReceiptStore
+from app.recovery import RecoveryStore
 from app.resolver import ContactResolver
 from app.tg_sender import TelegramSender
 
@@ -13,10 +16,10 @@ PHOTO_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"}
 VIDEO_EXTENSIONS = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 
 
-def _header(msg: MaxMessage, sender_label: str, chat_label: str, is_dm: bool) -> str:
+def _header(msg: MaxMessage, sender_label: str, is_dm: bool) -> str:
     if is_dm:
         return f"✉ <b>{sender_label}</b>"
-    return f"💬 <b>{chat_label}</b> | {sender_label}"
+    return f"💬 <b>{sender_label}</b>"
 
 
 def _extract_photo_url(attach: dict) -> str | None:
@@ -58,10 +61,8 @@ async def _send_attach(
     if atype == "CONTROL" or atype == "WIDGET" or atype == "INLINE_KEYBOARD":
         return False
 
-    # MAX's newer client sends voice messages with `_type=UNSUPPORTED` plus an
-    # `audioId` + `token` (our ver=11 client doesn't speak its native AUDIO
-    # variant). Treat this shape as audio.
-    if atype == "UNSUPPORTED" and attach.get("audioId") is not None:
+    # MAX may label a voice note AUDIO or UNSUPPORTED, depending on client.
+    if atype in ("UNSUPPORTED", "AUDIO") and attach.get("audioId") is not None:
         audio_id = attach.get("audioId")
         token = attach.get("token")
         duration = attach.get("duration", 0)
@@ -98,6 +99,29 @@ async def _send_attach(
         return True
 
     if atype == "VIDEO":
+        if msg and attach.get("videoId") is not None:
+            url = await client.download_video_url(
+                attach["videoId"], msg.chat_id, msg.message_id,
+                token=attach.get("token"),
+            )
+            if url:
+                data = await client.download_file(url)
+                if data:
+                    if attach.get("videoType") == 1:
+                        sent = await sender.send_video_note(
+                            data,
+                            duration=attach.get("duration"),
+                            length=attach.get("width"),
+                            message_thread_id=thread_id,
+                        )
+                        if sent:
+                            await sender.send(header_text, message_thread_id=thread_id)
+                            return True
+                    await sender.send_video(
+                        data, caption=header_text,
+                        message_thread_id=thread_id,
+                    )
+                    return True
         thumb = attach.get("thumbnail")
         if thumb:
             data = await client.download_file(thumb)
@@ -246,10 +270,12 @@ def _human_size(n: int) -> str:
 
 
 def create_max_client(
-    max_token: str, max_device_id: str, sender: TelegramSender, max_chat_ids: str | None = None,
+    max_token: str, max_device_id: str, sender: TelegramSender, max_chat_ids: str | None = None, max_exclude_chat_ids: str | None = None,
     debug: bool = False,
+    read_receipts: ReadReceiptStore | None = None,
+    recovery: RecoveryStore | None = None,
 ) -> MaxClient:
-    client = MaxClient(token=max_token, device_id=max_device_id, debug=debug, chat_ids=max_chat_ids)
+    client = MaxClient(token=max_token, device_id=max_device_id, debug=debug, chat_ids=max_chat_ids, exclude_chat_ids=max_exclude_chat_ids)
     resolver = ContactResolver(client=client)
     # Expose for tg_handler commands like /profile.
     client.resolver = resolver
@@ -257,6 +283,84 @@ def create_max_client(
     _first_connect = True
     _notif_count = 0
     _last_notif_time: datetime | None = None
+    _ready_task: asyncio.Task | None = None
+    _checkpoint_task: asyncio.Task | None = None
+    _delivery_locks: dict[int, asyncio.Lock] = {}
+
+    async def _checkpoint_loop():
+        while True:
+            await asyncio.sleep(30)
+            if recovery:
+                recovery.set("last_online", int(time.time() * 1000))
+
+    async def _recover(snapshot: dict):
+        if not recovery:
+            return
+        since = recovery.get("pending_since")
+        if since is None:
+            return
+        now = int(time.time() * 1000)
+        cutoff = max(since - 60000, now - 86400000)
+        ids = set()
+        for key in sender.topic_store._chats:
+            try:
+                ids.add(int(key))
+            except ValueError:
+                pass
+        for chat in snapshot.get("chats", []):
+            try:
+                ids.add(int(chat["id"]))
+            except (KeyError, ValueError, TypeError):
+                pass
+        ids -= client.exclude_chat_ids
+        if client.chat_ids:
+            ids &= client.chat_ids
+        recovered = 0
+        failed = 0
+        for chat_id in sorted(ids):
+            before = now
+            found = []
+            complete = False
+            for _ in range(10):
+                page = await client.fetch_history(chat_id, before, count=100)
+                if page is None:
+                    failed += 1
+                    break
+                if not page:
+                    complete = True
+                    break
+                valid = [m for m in page if isinstance(m, dict) and isinstance(m.get("time"), int)]
+                if not valid:
+                    failed += 1
+                    break
+                found.extend(m for m in valid if m["time"] >= cutoff)
+                oldest = min(m["time"] for m in valid)
+                if oldest <= cutoff:
+                    complete = True
+                    break
+                if oldest >= before:
+                    failed += 1
+                    break
+                before = oldest - 1
+            if not complete and failed == 0:
+                failed += 1
+            if not complete:
+                continue
+            for item in sorted(found, key=lambda m: (m["time"], str(m.get("id", "")))):
+                msg = client.parse_history_message(chat_id, item)
+                if msg and not msg.is_self:
+                    try:
+                        if await handle_message(msg):
+                            recovered += 1
+                    except Exception:
+                        failed += 1
+                        log.exception("History delivery failed for chat=%s message=%s", chat_id, msg.message_id)
+        if failed:
+            log.warning("History recovery incomplete: chats=%d recovered=%d failures=%d", len(ids), recovered, failed)
+        else:
+            recovery.set("pending_since", 0)
+            recovery.prune()
+            log.info("History recovery complete: chats=%d recovered=%d", len(ids), recovered)
 
     def _can_notify() -> bool:
         if _last_notif_time is None:
@@ -270,27 +374,41 @@ def create_max_client(
 
     @client.on_ready
     async def handle_ready(snapshot: dict):
-        nonlocal _first_connect
+        nonlocal _first_connect, _ready_task, _checkpoint_task
         participant_ids = resolver.load_snapshot(snapshot)
+        was_first_connect = _first_connect
 
-        if participant_ids:
-            log.info("Batch-resolving %d participants...", len(participant_ids))
-            await resolver.resolve_users_batch(participant_ids)
-            log.info("Resolved users: %s", resolver.users)
+        if recovery:
+            if recovery.get("pending_since") in (None, 0):
+                last_online = recovery.get("last_online")
+                if last_online:
+                    recovery.set("pending_since", last_online)
+            recovery.set("last_online", int(time.time() * 1000))
 
-            log.info("Known chats: %s", resolver.chats)
-            log.info("Known users: %s", resolver.users)
+        async def finish_ready():
+            if participant_ids:
+                log.info("Batch-resolving %d participants...", len(participant_ids))
+                await resolver.resolve_users_batch(participant_ids)
+            await _recover(snapshot)
 
-        if not _first_connect:
+        if not was_first_connect:
             await sender.send("✅ <b>Max:</b> соединение восстановлено")
         else:
-            chat_count = len(resolver.chats)
-            await sender.send(f"✅ <b>Max:</b> подключён | чатов: {chat_count}")
+            await sender.send(f"✅ <b>Max:</b> подключён | чатов: {len(resolver.chats)}")
+        _ready_task = asyncio.create_task(finish_ready())
+        _ready_task.add_done_callback(lambda task: log.error("Ready task failed", exc_info=task.exception()) if not task.cancelled() and task.exception() else None)
+        _checkpoint_task = asyncio.create_task(_checkpoint_loop())
         _first_connect = False
 
     @client.on_disconnect
     async def handle_disconnect():
         nonlocal _notif_count, _last_notif_time
+        if _ready_task and not _ready_task.done():
+            _ready_task.cancel()
+        if _checkpoint_task and not _checkpoint_task.done():
+            _checkpoint_task.cancel()
+        if recovery and recovery.get("pending_since") in (None, 0):
+            recovery.set("pending_since", recovery.get("last_online") or int(time.time() * 1000))
         if not _can_notify():
             log.info("Disconnect notification suppressed (throttle)")
             return
@@ -298,8 +416,31 @@ def create_max_client(
         _last_notif_time = datetime.now()
         await sender.send("⚠️ <b>Max:</b> соединение потеряно, переподключение...")
 
-    @client.on_message
-    async def handle_message(msg: MaxMessage):
+    @client.on_read_mark
+    async def handle_read_mark(payload: dict):
+        if read_receipts is None or payload.get("setAsUnread") is not False:
+            return
+        try:
+            chat_id = int(payload["chatId"])
+            peer_id = int(payload["userId"])
+            mark = int(payload["mark"])
+        except (KeyError, TypeError, ValueError):
+            return
+        # Only personal chats are registered in this store. A group member's
+        # mark can therefore never change a Telegram reaction.
+        for tg_message_id in read_receipts.mark_read(chat_id, peer_id, mark):
+            try:
+                await sender.bot.set_message_reaction(
+                    chat_id=sender.chat_id,
+                    message_id=tg_message_id,
+                    reaction="👀",
+                )
+            except Exception:
+                log.warning("Could not mark a Telegram message as read", exc_info=True)
+            else:
+                read_receipts.acknowledge(chat_id, tg_message_id)
+
+    async def _forward_message(msg: MaxMessage):
         log.info(
             "New message: chat=%s sender=%s is_self=%s text=%r attaches=%d",
             msg.chat_id,
@@ -340,8 +481,7 @@ def create_max_client(
             ))
 
         sender_label = escape(raw_sender)
-        chat_label = escape(raw_chat)
-        header_text = _header(msg, sender_label, chat_label, is_dm)
+        header_text = _header(msg, sender_label, is_dm)
 
         link = msg.link
         link_type = link.get("type") if isinstance(link, dict) else None
@@ -375,5 +515,22 @@ def create_max_client(
             body = escape(msg.text) if msg.text else "<i>[нетекстовое сообщение]</i>"
             await sender.send(f"{header_text}\n{body}", message_thread_id=thread_id)
             log.info("Forwarded text → TG")
+
+    @client.on_message
+    async def handle_message(msg: MaxMessage) -> bool:
+        if msg.is_self:
+            return False
+        lock = _delivery_locks.setdefault(int(msg.chat_id), asyncio.Lock())
+        async with lock:
+            if recovery and msg.message_id and recovery.seen(msg.chat_id, msg.message_id):
+                return False
+            token = sender.require_success.set(True)
+            try:
+                await _forward_message(msg)
+                if recovery and msg.message_id:
+                    recovery.mark(msg.chat_id, msg.message_id)
+                return True
+            finally:
+                sender.require_success.reset(token)
 
     return client

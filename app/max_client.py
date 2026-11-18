@@ -4,6 +4,7 @@ import logging
 import os
 import random
 import time
+from urllib.parse import urlparse
 from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Any
@@ -68,14 +69,18 @@ class OpCode(IntEnum):
     CONTACT_GET = 32
     CONTACT_PRESENCE = 35
     CHAT_GET = 48
+    CHAT_HISTORY = 49
     SEND_MESSAGE = 64
     ATTACH_TYPING = 65        # "I'm uploading <type> in this chat"
     EDIT_MESSAGE = 67
     PHOTO_UPLOAD_URL = 80     # get URL for photo upload
+    VIDEO_PLAY = 83           # resolve a video attachment to an MP4 URL
     AUDIO_UPLOAD_URL = 86     # get URL for voice/audio upload (experimental)
     FILE_UPLOAD_URL = 87      # get URL for file upload
     DISPATCH = 128
     UPLOAD_READY = 136        # server says an uploaded file/video is processed
+    READ_MARK_PUSH = 130      # another participant advanced their read marker
+    AUDIO_PLAY = 301          # resolve a voice attachment to an OGG URL
 
 
 @dataclass
@@ -95,9 +100,8 @@ class MaxClient:
     WS_URL = "wss://ws-api.oneme.ru/websocket"
     HEARTBEAT_SEC = 30
     RECONNECT_SEC = 5
-    chat_ids = []
 
-    def __init__(self, token: str, device_id: str, chat_ids: str | None = None, debug: bool = False):
+    def __init__(self, token: str, device_id: str, chat_ids: str | None = None, debug: bool = False, exclude_chat_ids: str | None = None):
         self.token = token
         self.device_id = device_id
         self.debug = debug
@@ -106,14 +110,15 @@ class MaxClient:
         self._my_id = None
         self._on_ready_cb = None
         self._on_message_cb = None
+        self._on_read_mark_cb = None
         self._heartbeat_task: asyncio.Task | None = None
         self._session: aiohttp.ClientSession | None = None
         self._dispatch_counter = 0
         self._pending: dict[int, asyncio.Future] = {}
         self._file_pending: dict[int, asyncio.Future] = {}
         self._on_disconnect_cb = None
-        if chat_ids:
-            self.chat_ids += map(int, map(str.strip, chat_ids.split(',')))
+        self.chat_ids = set(map(int, map(str.strip, chat_ids.split(',')))) if chat_ids else set()
+        self.exclude_chat_ids = set(map(int, map(str.strip, exclude_chat_ids.split(',')))) if exclude_chat_ids else set()
 
     # ── decorator API ──────────────────────────────────────────────
 
@@ -123,6 +128,10 @@ class MaxClient:
 
     def on_message(self, func):
         self._on_message_cb = func
+        return func
+
+    def on_read_mark(self, func):
+        self._on_read_mark_cb = func
         return func
 
     def on_disconnect(self, func):
@@ -218,6 +227,11 @@ class MaxClient:
                             ):
                                 log.warning("WebSocket closed/error: %s", msg.type)
                                 break
+                        log.warning(
+                            "WebSocket ended: close_code=%s exception=%s",
+                            ws.close_code,
+                            type(ws.exception()).__name__ if ws.exception() else "none",
+                        )
 
                 except Exception:
                     log.exception("Connection error")
@@ -273,7 +287,7 @@ class MaxClient:
                 await self._send(
                     OpCode.AUTH_SNAPSHOT,
                     {
-                        "chatsCount": 10,
+                        "chatsCount": 100,
                         "interactive": True,
                         "token": self.token,
                     },
@@ -297,9 +311,14 @@ class MaxClient:
 
                 if self._on_message_cb:
                     msg = self._parse_message(payload)
-                    if msg is not None and ((not self.chat_ids) or (msg.chat_id in self.chat_ids)):
+                    if msg is not None and msg.chat_id not in self.exclude_chat_ids and ((not self.chat_ids) or (msg.chat_id in self.chat_ids)):
                         task = asyncio.create_task(self._on_message_cb(msg))
                         task.add_done_callback(_log_task_exception)
+
+            elif op == OpCode.READ_MARK_PUSH and cmd == 0:
+                if self._on_read_mark_cb:
+                    task = asyncio.create_task(self._on_read_mark_cb(payload))
+                    task.add_done_callback(_log_task_exception)
 
             elif op == OpCode.UPLOAD_READY:
                 # Server confirms an uploaded file/video finished server-side processing.
@@ -327,6 +346,22 @@ class MaxClient:
             self._dump_json("contacts_response.json", resp)
         log.info("fetch_contacts(%s) → keys: %s", contact_ids, list(resp.keys()))
         return resp
+
+    async def fetch_history(self, chat_id: int, before_ms: int, count: int = 100) -> list[dict] | None:
+        """Read a page of MAX chat history; None means the request failed."""
+        response = await self.cmd(
+            OpCode.CHAT_HISTORY,
+            {"chatId": chat_id, "from": before_ms, "forward": 0,
+             "backward": count, "getMessages": True, "getChat": False,
+             "interactive": False},
+            timeout=20,
+        )
+        if not response or "_max_error" in response or not isinstance(response.get("messages"), list):
+            return None
+        return response["messages"]
+
+    def parse_history_message(self, chat_id: int, message: dict) -> MaxMessage | None:
+        return self._parse_message({"chatId": chat_id, "message": message})
 
     async def send_message(self, chat_id, text: str = "", elements=None,
                             attaches=None) -> dict:
@@ -414,84 +449,62 @@ class MaxClient:
 
     async def download_audio_url(self, audio_id, chat_id, message_id,
                                   token: str | None = None) -> str | None:
-        """Resolve an audio attach reference into a downloadable URL.
-
-        Empirically: opcodes 84/85/89 in this range are routed to the calls
-        service or other unrelated subsystems and a single proto.payload
-        validation failure tears down the whole WebSocket. So instead of
-        blind opcode probing, try the same HTTP URL pattern that MAX uses
-        for incoming photos — both are tokenised through the same CDN
-        (i.oneme.ru) and the audio `token` happens to look like the `r`
-        parameter used in photo baseUrls.
-        """
-        if not token:
-            log.warning("download_audio_url: no token in attach")
-            return None
-
-        # Candidate URL templates, ordered by likelihood.
-        candidates = [
-            f"https://i.oneme.ru/i?r={token}",
-            f"https://i.oneme.ru/a?r={token}",
-            f"https://i.oneme.ru/audio?r={token}",
-            f"https://i.oneme.ru/?audioId={audio_id}&token={token}",
-        ]
-        log.info("download_audio_url: trying %d HTTP candidates", len(candidates))
-        for url in candidates:
-            ok = await self._probe_audio_url(url)
-            if ok:
-                log.info("download_audio_url: found audio at %s", url[:80])
-                return url
-
-        # Last cheap try: maybe the audio is stored in the same backend as
-        # regular files, so opcode 88 (file_download) with audioId-as-fileId
-        # could resolve. This opcode is well-known and won't tear down WS.
+        """Resolve a MAX voice attachment through AUDIO_PLAY (opcode 301)."""
         try:
-            audio_id_int = int(audio_id)
-        except (TypeError, ValueError):
-            audio_id_int = None
-        if audio_id_int is not None and chat_id is not None and message_id:
-            resp = await self.cmd(88, {
-                "fileId": audio_id_int,
-                "chatId": chat_id,
+            payload = {
+                "audioId": int(audio_id),
+                "chatId": int(chat_id),
                 "messageId": str(message_id),
-            })
-            log.info("download_audio_url op=88(file-as-audio) → %s",
-                     str(resp)[:400] if resp else resp)
-            if resp and "_max_error" not in resp:
-                url = resp.get("url")
-                if isinstance(url, str) and url.startswith("http"):
-                    return url
+            }
+        except (TypeError, ValueError):
+            return None
+        if token:
+            payload["token"] = token
+        resp = await self.cmd(OpCode.AUDIO_PLAY, payload)
+        if not resp or "_max_error" in resp:
+            log.warning("AUDIO_PLAY did not return an audio URL")
+            return None
+        url = resp.get("opus") or resp.get("url")
+        return url if self._is_max_media_url(url) else None
 
-        log.warning("download_audio_url: nothing resolved an audio URL")
-        return None
-
-    async def _probe_audio_url(self, url: str) -> bool:
-        """HEAD-probe a candidate URL — accept if HTTP 200 with non-HTML body."""
-        session = getattr(self, "_session", None)
-        close_after = False
-        if session is None or session.closed:
-            session = aiohttp.ClientSession(headers=_BROWSER_HEADERS)
-            close_after = True
+    async def download_video_url(self, video_id, chat_id, message_id,
+                                  token: str | None = None) -> str | None:
+        """Resolve a MAX video attachment through VIDEO_PLAY (opcode 83)."""
         try:
-            async with session.get(
-                url, headers=_HTTP_HEADERS,
-                timeout=aiohttp.ClientTimeout(total=15),
-            ) as resp:
-                ct = resp.headers.get("Content-Type", "")
-                log.info("probe %s → HTTP %d, Content-Type=%s",
-                          url[:80], resp.status, ct)
-                if resp.status != 200:
-                    return False
-                # Reject obviously-HTML responses (error/redirect pages).
-                if "text/html" in ct.lower():
-                    return False
-                return True
-        except Exception:
-            log.exception("probe error for %s", url[:80])
+            payload = {
+                "videoId": int(video_id),
+                "chatId": int(chat_id),
+                "messageId": str(message_id),
+            }
+        except (TypeError, ValueError):
+            return None
+        if token:
+            payload["token"] = token
+        resp = await self.cmd(OpCode.VIDEO_PLAY, payload)
+        if not resp or "_max_error" in resp:
+            log.warning("VIDEO_PLAY did not return a video URL")
+            return None
+        options = []
+        for key, value in resp.items():
+            if isinstance(key, str) and key.startswith("MP4_") and self._is_max_media_url(value):
+                try:
+                    options.append((int(key[4:]), value))
+                except ValueError:
+                    pass
+        if options:
+            return max(options)[1]
+        url = resp.get("url") or resp.get("dynamicUrl")
+        return url if self._is_max_media_url(url) else None
+
+    @staticmethod
+    def _is_max_media_url(url) -> bool:
+        if not isinstance(url, str):
             return False
-        finally:
-            if close_after:
-                await session.close()
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+        return parsed.scheme == "https" and (
+            host.endswith(".oneme.ru") or host.endswith(".okcdn.ru")
+        )
 
     async def upload_audio(self, data: bytes, chat_id=None,
                             filename: str = "voice.ogg",
@@ -595,7 +608,7 @@ class MaxClient:
                 await resp.read()
                 return True
         except Exception:
-            log.exception("Upload POST error: %s", url[:120])
+            log.exception("Upload POST error at %s", urlparse(url).hostname)
             return None
         finally:
             if close_after:
@@ -615,11 +628,11 @@ class MaxClient:
             ) as resp:
                 if resp.status == 200:
                     data = await resp.read()
-                    log.info("Downloaded %s (%d bytes)", url[:120], len(data))
+                    log.info("Downloaded from %s (%d bytes)", urlparse(url).hostname, len(data))
                     return data
-                log.warning("Download failed %s — HTTP %d", url[:120], resp.status)
+                log.warning("Download failed at %s — HTTP %d", urlparse(url).hostname, resp.status)
         except Exception:
-            log.exception("Download error: %s", url[:120])
+            log.exception("Download error at %s", urlparse(url).hostname)
         finally:
             if close_after:
                 await session.close()

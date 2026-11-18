@@ -63,7 +63,7 @@ class TestOnTopicMessage:
 
         max_client.send_message.assert_called_once_with(42, "Hello", elements=[])
 
-    async def test_reacts_on_success(self):
+    async def test_success_has_no_reaction(self):
         max_client = MagicMock()
         max_client.send_message = AsyncMock(return_value={"ok": True})
 
@@ -72,7 +72,28 @@ class TestOnTopicMessage:
 
         await _on_topic_message(update, ctx)
 
-        update.message.set_reaction.assert_called_once()
+        update.message.set_reaction.assert_not_called()
+
+    async def test_failed_send_gets_thumbs_down(self):
+        max_client = MagicMock()
+        max_client.send_message = AsyncMock(return_value={"_max_error": {"message": "failed"}})
+        update = _make_update()
+        ctx = _make_context(max_client=max_client, topic_store=_make_topic_store())
+
+        await _on_topic_message(update, ctx)
+
+        update.message.set_reaction.assert_awaited_once_with("👎")
+        update.message.reply_text.assert_awaited_once()
+
+    async def test_send_exception_gets_thumbs_down(self):
+        max_client = MagicMock()
+        max_client.send_message = AsyncMock(side_effect=RuntimeError("failed"))
+        update = _make_update()
+        ctx = _make_context(max_client=max_client, topic_store=_make_topic_store())
+
+        await _on_topic_message(update, ctx)
+
+        update.message.set_reaction.assert_awaited_once_with("👎")
 
     async def test_ignores_general_topic(self):
         max_client = MagicMock()

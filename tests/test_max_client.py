@@ -1,6 +1,7 @@
 """Tests for app/max_client.py — OpCode enum and _parse_message."""
 
 import pytest
+from unittest.mock import AsyncMock
 from app.max_client import MaxClient, MaxMessage, OpCode
 
 
@@ -44,6 +45,10 @@ class TestOpCode:
     def test_send_message(self):
         assert OpCode.SEND_MESSAGE == 64
 
+    def test_media_play_opcodes(self):
+        assert OpCode.VIDEO_PLAY == 83
+        assert OpCode.AUDIO_PLAY == 301
+
     def test_edit_message(self):
         assert OpCode.EDIT_MESSAGE == 67
 
@@ -62,6 +67,42 @@ class TestOpCode:
         # IntEnum should compare equal to a plain int
         assert OpCode.HANDSHAKE == 6
         assert 6 == OpCode.HANDSHAKE
+
+
+class TestMediaPlaybackUrls:
+    async def test_audio_play_returns_opus_url(self):
+        client = MaxClient(token="tok", device_id="dev")
+        url = "https://a.oneme.ru/audio?signature=private"
+        client.cmd = AsyncMock(return_value={"opus": url})
+
+        result = await client.download_audio_url(12, 34, "56", token="secret")
+
+        assert result == url
+        client.cmd.assert_awaited_once_with(
+            OpCode.AUDIO_PLAY,
+            {"audioId": 12, "chatId": 34, "messageId": "56", "token": "secret"},
+        )
+
+    async def test_video_play_prefers_mp4(self):
+        client = MaxClient(token="tok", device_id="dev")
+        client.cmd = AsyncMock(return_value={
+            "EXTERNAL": "https://m.ok.ru/video/1",
+            "MP4_240": "https://v.oneme.ru/low",
+            "MP4_480": "https://v.oneme.ru/high",
+        })
+
+        result = await client.download_video_url(12, 34, "56")
+
+        assert result == "https://v.oneme.ru/high"
+        client.cmd.assert_awaited_once_with(
+            OpCode.VIDEO_PLAY,
+            {"videoId": 12, "chatId": 34, "messageId": "56"},
+        )
+
+    async def test_rejects_untrusted_media_url(self):
+        client = MaxClient(token="tok", device_id="dev")
+        client.cmd = AsyncMock(return_value={"opus": "https://elsewhere.example/audio"})
+        assert await client.download_audio_url(12, 34, "56") is None
 
 
 # ---------------------------------------------------------------------------

@@ -1,7 +1,54 @@
 """Tests for app/max_listener.py — pure helper functions."""
 
 import pytest
-from app.max_listener import _human_size, _guess_media_kind
+from unittest.mock import AsyncMock, MagicMock
+from app.max_client import MaxMessage
+from app.max_listener import _human_size, _guess_media_kind, _send_attach
+
+
+class TestIncomingMedia:
+    async def test_unsupported_audio_becomes_voice(self):
+        client = MagicMock()
+        client.download_audio_url = AsyncMock(return_value="https://a.oneme.ru/audio")
+        client.download_file = AsyncMock(return_value=b"OggSvoice")
+        sender = MagicMock()
+        sender.send_voice = AsyncMock()
+        sender.send = AsyncMock()
+        msg = MaxMessage(chat_id=42, message_id="99")
+
+        handled = await _send_attach(
+            {"_type": "UNSUPPORTED", "audioId": 12, "token": "t", "duration": 2000},
+            client, sender, "sender", thread_id=7, msg=msg,
+        )
+
+        assert handled
+        sender.send_voice.assert_awaited_once_with(
+            b"OggSvoice", caption="sender", message_thread_id=7,
+        )
+        sender.send.assert_not_awaited()
+
+    async def test_round_video_becomes_video_note(self):
+        client = MagicMock()
+        client.download_video_url = AsyncMock(return_value="https://v.oneme.ru/video")
+        client.download_file = AsyncMock(return_value=b"mp4data")
+        sender = MagicMock()
+        sender.send_video_note = AsyncMock(return_value=True)
+        sender.send_video = AsyncMock()
+        sender.send = AsyncMock()
+        msg = MaxMessage(chat_id=42, message_id="99")
+
+        handled = await _send_attach(
+            {"_type": "VIDEO", "videoId": 12, "token": "t",
+             "videoType": 1, "width": 480, "duration": 2000},
+            client, sender, "sender", thread_id=7, msg=msg,
+        )
+
+        assert handled
+        sender.send_video_note.assert_awaited_once_with(
+            b"mp4data", duration=2000, length=480, message_thread_id=7,
+        )
+        sender.send_video.assert_not_awaited()
+        sender.send.assert_awaited_once_with("sender", message_thread_id=7)
 
 
 # ---------------------------------------------------------------------------
