@@ -9,6 +9,8 @@ from logging.handlers import RotatingFileHandler
 from telegram import Update
 
 from app.config import load_settings
+from app import max_version
+from app.max_client import _BROWSER_HEADERS
 from app.max_listener import create_max_client
 from app.read_receipts import ReadReceiptStore
 from app.recovery import RecoveryStore
@@ -109,11 +111,16 @@ async def main():
     else:
         log.info("Reply to Max disabled (REPLY_ENABLED=false)")
 
+    version_task = asyncio.create_task(
+        max_version.watch(client, notify=sender.send, headers=_BROWSER_HEADERS)
+    )
+
     log.info("Starting Max listener...")
     try:
         await client.run()
     finally:
         log.info("Shutting down...")
+        version_task.cancel()
         if tg_app:
             await tg_app.updater.stop()
             await tg_app.stop()

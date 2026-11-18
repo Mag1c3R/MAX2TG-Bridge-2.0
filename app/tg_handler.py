@@ -755,12 +755,14 @@ HELP_TEXT = (
     "в текущем топике (полезно после смены аватара).\n"
     "• <code>/del</code> — удалить текущий топик и связь с MAX-чатом "
     "(спросит подтверждение).\n"
+    "• <code>/rm</code> — ответом на сообщение: удалить его в MAX у обоих "
+    "собеседников и здесь.\n"
     "• <code>/help</code> — эта справка.\n\n"
     "Просто пиши в любом привязанном топике — сообщение уйдёт в "
     "соответствующий чат MAX. Поддерживается жирный/курсив/зачёркнутый/"
     "подчёркнутый текст, моноширинный код, цитаты и ссылки. Фото, "
-    "документы и видео тоже передаются. Голосовые приходят как .ogg "
-    "файл (пока MAX не вернул нам опкод нативной загрузки).\n\n"
+    "документы, видео, голосовые и кружочки тоже передаются. Ответ (reply) "
+    "уходит в MAX с цитатой, а правка своего сообщения правит его и в MAX.\n\n"
     "Если кто-то новый пишет тебе в MAX — топик создастся автоматически "
     "и в нём сразу появится карточка собеседника."
 )
@@ -772,6 +774,52 @@ async def _cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     await message.reply_text(HELP_TEXT, parse_mode="HTML",
                               disable_web_page_preview=True)
+
+
+async def _cmd_rm(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """/rm as a reply: delete that message in MAX for both sides, then in Telegram.
+
+    Telegram does not tell bots about deleted messages, so a delete has to be
+    asked for explicitly.
+    """
+    message = update.message
+    if message is None:
+        return
+    target = _resolve_topic_target(update, context)
+    if not target:
+        return
+    message, max_chat_id, max_client = target
+    reply = message.reply_to_message
+    if reply is None or reply.message_id == message.message_thread_id or reply.forum_topic_created:
+        await message.reply_text("Ответь командой /rm на сообщение, которое нужно удалить.")
+        return
+    store = context.bot_data.get(LINK_STORE_KEY)
+    found = store.max_for_tg(reply.message_id) if store else None
+    if not found or found[0] != str(max_chat_id):
+        await message.reply_text("⚠️ Не знаю, какое это сообщение в MAX — удалить его там не получится.")
+        return
+    if not max_client:
+        await _report_send_failure(message, "⚠️ Max клиент не подключён.")
+        return
+    try:
+        resp = await max_client.delete_message(max_chat_id, [found[1]], for_all=True)
+    except Exception:
+        log.exception("Failed to delete message in Max chat %s", max_chat_id)
+        await _report_send_failure(message, "⚠️ Ошибка при удалении в Max.")
+        return
+    err = (resp or {}).get("_max_error")
+    if err or not resp:
+        desc = (err or {}).get("localizedMessage") or (err or {}).get("message") or "нет ответа от MAX"
+        await _report_send_failure(message, f"⚠️ MAX не удалил сообщение: {desc}")
+        return
+    # The MAX message may span several Telegram messages (e.g. header + media).
+    tg_ids = set(store.tg_for_max(max_chat_id, found[1])) | {reply.message_id, message.message_id}
+    for tg_id in sorted(tg_ids):
+        try:
+            await context.bot.delete_message(chat_id=message.chat_id, message_id=tg_id)
+        except Exception:
+            log.warning("Could not delete Telegram message %s", tg_id, exc_info=True)
+    store.forget_tg(tg_ids)
 
 
 async def _cmd_del(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1057,6 +1105,7 @@ def build_tg_app(token: str, max_client: MaxClient, supergroup_id: str,
     app.add_handler(CommandHandler("profile", _cmd_profile, filters=chat_filter))
     app.add_handler(CommandHandler("intro", _cmd_intro, filters=chat_filter))
     app.add_handler(CommandHandler("del", _cmd_del, filters=chat_filter))
+    app.add_handler(CommandHandler("rm", _cmd_rm, filters=chat_filter))
     app.add_handler(CommandHandler("help", _cmd_help, filters=chat_filter))
     app.add_handler(CallbackQueryHandler(_on_del_callback, pattern=r"^del:"))
     app.add_handler(

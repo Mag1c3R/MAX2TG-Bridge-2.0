@@ -507,3 +507,16 @@ class TestOggWaveform:
 
     def test_silence_is_flat(self):
         assert len(set(ogg_waveform(_ogg([3] * 100)))) == 1
+
+
+class TestDeleteMessage:
+    async def test_delete_for_all_payload(self):
+        c = MaxClient(token="tok", device_id="dev")
+        c.cmd = AsyncMock(return_value={"messageIds": [115000000000000001]})
+        await c.delete_message(42, ["115000000000000001"])
+        assert c.cmd.await_args.args == (OpCode.DELETE_MESSAGE,
+            {"chatId": 42, "messageIds": [115000000000000001], "forMe": False})
+
+    def test_handshake_version_follows_client(self):
+        c = MaxClient(token="tok", device_id="dev")
+        assert c.app_version == "26.11.9"

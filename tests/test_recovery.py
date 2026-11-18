@@ -57,3 +57,13 @@ def test_tg_links_roundtrip(tmp_path):
     assert store.max_for_tg(1) is None
     store.link_tg(1, -70, 123456789012345678)
     assert RecoveryStore(str(tmp_path / 'recovery.sqlite3')).max_for_tg(1) == ('-70', '123456789012345678')
+
+
+def test_tg_reverse_lookup_and_forget(tmp_path):
+    store = RecoveryStore(str(tmp_path / 'recovery.sqlite3'))
+    store.link_tg(1, 42, 'm1')
+    store.link_tg(2, 42, 'm1')
+    store.link_tg(3, 42, 'm2')
+    assert sorted(store.tg_for_max(42, 'm1')) == [1, 2]
+    store.forget_tg([1, 2])
+    assert store.tg_for_max(42, 'm1') == [] and store.max_for_tg(3) == ('42', 'm2')

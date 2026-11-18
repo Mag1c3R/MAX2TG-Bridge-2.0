@@ -213,6 +213,7 @@ class OpCode(IntEnum):
     CHAT_HISTORY = 49
     SEND_MESSAGE = 64
     ATTACH_TYPING = 65        # "I'm uploading <type> in this chat"
+    DELETE_MESSAGE = 66
     EDIT_MESSAGE = 67
     PHOTO_UPLOAD_URL = 80     # get URL for photo upload
     MEDIA_UPLOAD_URL = 82     # slot for direct voice (type 2) / video note (type 1) upload
@@ -247,6 +248,8 @@ class MaxClient:
         self.token = token
         self.device_id = device_id
         self.debug = debug
+        # Kept current from web.max.ru by app.max_version.watch.
+        self.app_version = APP_VERSION
         self._ws: aiohttp.ClientWebSocketResponse | None = None
         self._seq = 0
         self._last_in_seq = 0
@@ -358,7 +361,7 @@ class MaxClient:
                                     "deviceName": "Google Chrome 131.0.0.0",
                                     "headerUserAgent": _USER_AGENT,
                                     "isPwa": False,
-                                    "appVersion": APP_VERSION,
+                                    "appVersion": self.app_version,
                                     "screen": "1080x1920 1.0x",
                                     "timezone": "Europe/Moscow",
                                 },
@@ -587,6 +590,18 @@ class MaxClient:
         )
         ok = bool(resp) and "_max_error" not in resp
         log.info("edit_message(chat=%s, msg=%s) → %s", chat_id, message_id, "OK" if ok else "FAIL")
+        return resp
+
+    async def delete_message(self, chat_id, message_ids, for_all: bool = True) -> dict:
+        """Delete MAX messages; ``for_all`` removes them for every participant."""
+        ids = [int(m) if str(m).isdigit() else m for m in message_ids]
+        resp = await self.cmd(
+            OpCode.DELETE_MESSAGE,
+            {"chatId": chat_id, "messageIds": ids, "forMe": not for_all},
+        )
+        ok = bool(resp) and "_max_error" not in resp
+        log.info("delete_message(chat=%s, msgs=%s, for_all=%s) → %s",
+                 chat_id, ids, for_all, "OK" if ok else "FAIL")
         return resp
 
     # ── media upload ───────────────────────────────────────────────

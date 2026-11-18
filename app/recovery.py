@@ -38,6 +38,14 @@ class RecoveryStore:
         row = self.db.execute("SELECT chat_id, message_id FROM tg_links WHERE tg_message_id=?", (int(tg_message_id),)).fetchone()
         return (row[0], row[1]) if row else None
 
+    def tg_for_max(self, chat_id, message_id) -> list[int]:
+        rows = self.db.execute("SELECT tg_message_id FROM tg_links WHERE chat_id=? AND message_id=?", (str(chat_id), str(message_id))).fetchall()
+        return [r[0] for r in rows]
+
+    def forget_tg(self, tg_message_ids) -> None:
+        self.db.executemany("DELETE FROM tg_links WHERE tg_message_id=?", [(int(t),) for t in tg_message_ids])
+        self.db.commit()
+
     def prune(self) -> None:
         now = int(time.time() * 1000)
         self.db.execute("DELETE FROM delivered WHERE delivered_at < ?", (now - 7 * 86400000,))

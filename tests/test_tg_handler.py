@@ -343,3 +343,59 @@ class TestDurationMs:
 
     def test_none(self):
         assert _duration_ms(None) == 0
+
+
+# ---------------------------------------------------------------------------
+# /rm — delete for both sides
+# ---------------------------------------------------------------------------
+
+from app.tg_handler import _cmd_rm
+
+
+class TestDeleteCommand:
+    def _ctx(self, tmp_path, resp=None):
+        store = RecoveryStore(str(tmp_path / "r.sqlite3"))
+        max_client = MagicMock()
+        max_client.delete_message = AsyncMock(return_value={"messageIds": [999]} if resp is None else resp)
+        ctx = _make_context(max_client=max_client, topic_store=_make_topic_store({10: 42}))
+        ctx.bot_data[LINK_STORE_KEY] = store
+        ctx.bot = MagicMock()
+        ctx.bot.delete_message = AsyncMock()
+        return ctx, store, max_client
+
+    def _update(self, reply_to_id=300):
+        update = _reply_update(reply_to_id, message_id=600)
+        update.message.text = "/rm"
+        update.message.chat_id = -100123
+        return update
+
+    async def test_deletes_in_max_for_all_and_in_telegram(self, tmp_path):
+        ctx, store, max_client = self._ctx(tmp_path)
+        store.link_tg(300, 42, "999")
+        store.link_tg(301, 42, "999")  # media + header of one MAX message
+        await _cmd_rm(self._update(300), ctx)
+        max_client.delete_message.assert_awaited_once_with(42, ["999"], for_all=True)
+        deleted = sorted(c.kwargs["message_id"] for c in ctx.bot.delete_message.await_args_list)
+        assert deleted == [300, 301, 600]
+        assert store.max_for_tg(300) is None
+
+    async def test_unknown_message_is_not_deleted(self, tmp_path):
+        ctx, _, max_client = self._ctx(tmp_path)
+        update = self._update(300)
+        await _cmd_rm(update, ctx)
+        max_client.delete_message.assert_not_awaited()
+        update.message.reply_text.assert_awaited_once()
+
+    async def test_needs_a_reply(self, tmp_path):
+        ctx, _, max_client = self._ctx(tmp_path)
+        update = self._update(10)  # reply to the topic root = no real reply
+        await _cmd_rm(update, ctx)
+        max_client.delete_message.assert_not_awaited()
+
+    async def test_max_error_keeps_telegram_messages(self, tmp_path):
+        ctx, store, _ = self._ctx(tmp_path, resp={"_max_error": {"message": "denied"}})
+        store.link_tg(300, 42, "999")
+        update = self._update(300)
+        await _cmd_rm(update, ctx)
+        ctx.bot.delete_message.assert_not_awaited()
+        update.message.set_reaction.assert_awaited_once_with("👎")
