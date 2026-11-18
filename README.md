@@ -4,7 +4,9 @@
 
 # MAX2TG-Bridge 2.0
 
-**MAX2TG-Bridge 2.0 by [Mag1c3R](https://github.com/Mag1c3R)** — основан на [ircitdev/MAX2TG-Bridge](https://github.com/ircitdev/MAX2TG-Bridge). Что изменилось по сравнению с ним — в разделе [Что нового в 2.0](#что-нового-в-20).
+[![tests](https://github.com/Mag1c3R/MAX2TG-Bridge-2.0/actions/workflows/tests.yml/badge.svg)](https://github.com/Mag1c3R/MAX2TG-Bridge-2.0/actions/workflows/tests.yml) [![docker](https://github.com/Mag1c3R/MAX2TG-Bridge-2.0/actions/workflows/docker.yml/badge.svg)](https://github.com/Mag1c3R/MAX2TG-Bridge-2.0/pkgs/container/max2tg-bridge-2.0) [![release](https://img.shields.io/github/v/release/Mag1c3R/MAX2TG-Bridge-2.0)](https://github.com/Mag1c3R/MAX2TG-Bridge-2.0/releases) [![license](https://img.shields.io/github/license/Mag1c3R/MAX2TG-Bridge-2.0)](LICENSE)
+
+**MAX2TG-Bridge 2.0 by [Mag1c3R](https://github.com/Mag1c3R)** — основан на [ircitdev/MAX2TG-Bridge](https://github.com/ircitdev/MAX2TG-Bridge). Что изменилось по сравнению с ним — в разделе [Что нового в 2.0](#что-нового-в-20) и в [CHANGELOG](CHANGELOG.md).
 
 > Двусторонний мост между мессенджером **MAX** (`web.max.ru` / `api.oneme.ru`) и **Telegram** через форум-топики в супергруппе.
 
@@ -50,6 +52,7 @@
 ### Telegram → MAX
 - **Ответ с цитатой:** ответ (reply) на сообщение в топике уходит в MAX как ответ на исходное сообщение — и на чужое, и на своё.
 - **Правка сообщений:** если исправить своё сообщение в Telegram, оно изменится и в MAX.
+- **Удаление у обоих:** команда `/rm` ответом на сообщение удаляет его в MAX у обоих собеседников и в Telegram. Командой — потому что Telegram не сообщает ботам об удалённых сообщениях.
 - **Голосовые** уходят нативными голосовыми MAX, а не файлом `.ogg`. Волну громкости мост оценивает сам по размерам Opus-пакетов: без неё MAX голосовое не принимает.
 - **Кружочки** уходят нативными кружочками MAX. Раньше бот их не принимал вовсе.
 - Пока загружается голосовое или кружочек, собеседник видит «записывает…».
@@ -64,6 +67,7 @@
 - **Восстановление после обрыва:** после переподключения мост дочитывает историю чатов и доставляет пропущенные сообщения ровно один раз (`state/recovery.sqlite3`).
 - **Строгая доставка:** если сообщение не удалось отправить в Telegram, оно не помечается доставленным, и мост дошлёт его при следующем восстановлении после переподключения.
 - **Исключение чатов:** `MAX_EXCLUDE_CHAT_IDS` — чаты MAX, которые мост пропускает.
+- **Слежение за версией MAX:** при запуске и раз в 6 часов мост читает версию веб-клиента с `web.max.ru`, подключается с ней и пишет в General-топик, если MAX обновился. Смена адреса веб-сокета — признак смены протокола, о ней приходит отдельное предупреждение.
 - При ошибке отправки в MAX на сообщение ставится 👎 и приходит текст ошибки.
 
 ---
@@ -143,7 +147,7 @@
 
 1. Создай супергруппу и в её настройках включи **«Темы» / «Topics»**.
 2. У [@BotFather](https://t.me/BotFather) сделай нового бота → запиши **`TG_BOT_TOKEN`**.
-3. Добавь бота в супергруппу администратором, поставь галку «Управление темами» (без этого права бот не сможет создавать топики).
+3. Добавь бота в супергруппу администратором, поставь галки «Управление темами» (без этого права бот не сможет создавать топики) и «Удаление сообщений» (для `/rm`).
 4. Получи **`TG_CHAT_ID`** супергруппы: перешли любое сообщение из неё боту [@userinfobot](https://t.me/userinfobot) — он покажет id вида `-100…`.
 5. (Опционально) Свой Telegram-user-id — для `TG_ALLOWED_USER_ID` (тот же @userinfobot в личке).
 6. В настройках реакций супергруппы разреши «**Все эмодзи**», чтобы бот мог ставить 👀 и 👎 на отправленные ответы.
@@ -160,6 +164,21 @@
 > При логине в web.max.ru с другого устройства токен может ротироваться — тогда повторите шаги выше и обновите `.env`.
 
 ### 3. Деплой (Docker, рекомендованный)
+
+Готовый образ (`linux/amd64`, `linux/arm64`) публикуется в GitHub Container Registry:
+
+```bash
+mkdir max2tg && cd max2tg
+curl -fsSLo .env https://raw.githubusercontent.com/Mag1c3R/MAX2TG-Bridge-2.0/main/.env.example
+# отредактируйте .env
+docker run -d --name max2tg --restart unless-stopped --env-file .env \
+  -e STATE_DIR=/app/state -e LOG_DIR=/app/logs \
+  -v "$PWD/state:/app/state" -v "$PWD/logs:/app/logs" \
+  ghcr.io/mag1c3r/max2tg-bridge-2.0:latest
+docker logs -f max2tg
+```
+
+Или собрать из исходников:
 
 ```bash
 git clone https://github.com/Mag1c3R/MAX2TG-Bridge-2.0.git max2tg
@@ -241,6 +260,7 @@ sudo journalctl -u max2tg -f
 | `/profile` | (в топике) Показать профиль собеседника MAX: имя, id, аватар. |
 | `/intro` | (в топике) Перепостить и закрепить карточку профиля. |
 | `/del` | (в топике) Удалить топик и снять связь с MAX-чатом (с подтверждением). |
+| `/rm` | (ответом на сообщение в топике) Удалить сообщение в MAX у обоих собеседников и здесь. |
 | `/help` | Список всех команд. |
 
 ---
@@ -252,7 +272,8 @@ sudo journalctl -u max2tg -f
 3. **Кастомные эмодзи как реакции** — Telegram запрещает ботам ставить custom-emoji реакции, поэтому используются обычные `👀` и `👎`.
 4. **Phone / about** в `/profile` отсутствуют — опкод `CONTACT_GET` (32) возвращает только имя и аватар.
 5. **Ротация MAX-токена** — если ты залогинишься в web.max.ru с другого устройства, токен моста может стать невалидным (handshake висит без `Authorized!`). Решение: обновить `MAX_TOKEN` в `.env`.
-6. **Версия веб-клиента MAX** зашита в коде (`APP_VERSION` в `app/max_client.py`). Если MAX снова сменит протокол, мост может перестать подключаться.
+6. **Смена протокола MAX** — новую версию веб-клиента мост подхватывает сам, но если MAX снова поменяет формат кадров или адрес веб-сокета, понадобится обновление кода. Мост предупредит об этом в General-топике.
+7. **«Печатает…» и удаление в Telegram** — Bot API не сообщает ботам, что пользователь печатает или удалил сообщение, поэтому эти события в MAX не передаются. Для удаления есть `/rm`.
 
 ---
 
@@ -265,7 +286,7 @@ pip install pytest pytest-asyncio
 pytest -q
 ```
 
-Покрытие: `app/topics.py` (TopicStore), `app/config.py` (загрузка env), `app/max_listener.py` (форматирование, throttle), `app/tg_handler.py` (роутинг команд и медиа), `app/max_client.py` (опкоды). 191 тест.
+Покрытие: `app/topics.py` (TopicStore), `app/config.py` (загрузка env), `app/max_listener.py` (форматирование, throttle), `app/tg_handler.py` (роутинг команд, медиа, ответы, правки, `/rm`), `app/max_client.py` (опкоды, бинарный кодек протокола v10, загрузка голосовых и кружочков), `app/max_version.py`, `app/recovery.py`. 257 тестов, запускаются в GitHub Actions на каждый push.
 
 ### Структура проекта
 
