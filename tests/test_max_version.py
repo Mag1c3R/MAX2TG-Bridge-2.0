@@ -54,3 +54,24 @@ class TestWatch:
         task.cancel()
         assert client.app_version == "26.11.9"
         notify.assert_not_awaited()
+
+
+class TestDetectHeaders:
+    async def test_brotli_is_never_requested(self):
+        seen = []
+
+        class Resp:
+            status = 200
+            def __init__(self, body): self.body = body
+            async def text(self): return self.body
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): return False
+
+        class Session:
+            def get(self, url, headers=None, timeout=None):
+                seen.append(headers["Accept-Encoding"])
+                return Resp('<script src="/a.js"></script>' if url.endswith("/") else BUNDLE)
+
+        found = await max_version.detect(Session(), {"Accept-Encoding": "gzip, deflate, br, zstd"})
+        assert found == ("wss://api.oneme.ru/websocket", "26.11.9")
+        assert seen == ["gzip, deflate", "gzip, deflate"]

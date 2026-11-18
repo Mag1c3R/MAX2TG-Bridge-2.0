@@ -33,6 +33,8 @@ def parse_bundle(js: str) -> tuple[str, str] | None:
 async def detect(session: aiohttp.ClientSession, headers: dict | None = None) -> tuple[str, str] | None:
     """Fetch web.max.ru and return (ws_url, app_version) from its scripts."""
     timeout = aiohttp.ClientTimeout(total=30)
+    # aiohttp ships without a brotli decoder, and web.max.ru uses it when offered.
+    headers = {**(headers or {}), "Accept-Encoding": "gzip, deflate"}
     try:
         async with session.get(WEB_URL, headers=headers, timeout=timeout) as resp:
             html = await resp.text()
