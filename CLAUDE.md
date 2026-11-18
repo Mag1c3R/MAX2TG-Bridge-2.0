@@ -6,7 +6,7 @@
 
 Двусторонний мост MAX (`ws-api.oneme.ru`) ↔ Telegram через форум-топики супергруппы. Каждый MAX-чат = свой topic в Telegram. Userbot подключается WebSocket'ом к MAX по `__oneme_auth` токену, Telegram-side — обычный bot через python-telegram-bot polling.
 
-MAX2TG-Bridge by Mag1c3R, основан на [ircitdev/MAX2TG-Bridge](https://github.com/ircitdev/MAX2TG-Bridge), который основан на [Aist/max2tg](https://github.com/Aist/max2tg). Лицензия MIT.
+MAX2TG-Bridge 2.0 by Mag1c3R, основан на [ircitdev/MAX2TG-Bridge](https://github.com/ircitdev/MAX2TG-Bridge), который основан на [Aist/max2tg](https://github.com/Aist/max2tg). Лицензия MIT.
 
 ## Структура
 
