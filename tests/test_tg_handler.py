@@ -61,7 +61,7 @@ class TestOnTopicMessage:
 
         await _on_topic_message(update, ctx)
 
-        max_client.send_message.assert_called_once_with(42, "Hello", elements=[])
+        max_client.send_message.assert_called_once_with(42, "Hello", elements=[], reply_to=None)
 
     async def test_success_has_no_reaction(self):
         max_client = MagicMock()
@@ -213,3 +213,133 @@ class TestBuildTgApp:
                             _make_topic_store())
 
         assert app.handlers[0]
+
+
+# ---------------------------------------------------------------------------
+# Telegram reply → MAX reply (quote)
+# ---------------------------------------------------------------------------
+
+from app.recovery import RecoveryStore
+from app.tg_handler import LINK_STORE_KEY
+
+
+def _reply_update(reply_to_id, thread_id=10, message_id=500):
+    update = _make_update("ответ", thread_id=thread_id)
+    update.message.message_id = message_id
+    update.message.entities = []
+    reply = MagicMock()
+    reply.message_id = reply_to_id
+    reply.forum_topic_created = None
+    update.message.reply_to_message = reply
+    return update
+
+
+class TestReplyQuote:
+    def _ctx(self, tmp_path, resp=None):
+        store = RecoveryStore(str(tmp_path / "r.sqlite3"))
+        max_client = MagicMock()
+        max_client.send_message = AsyncMock(return_value=resp or {"message": {"id": 999}})
+        ctx = _make_context(max_client=max_client, topic_store=_make_topic_store({10: 42}))
+        ctx.bot_data[LINK_STORE_KEY] = store
+        return ctx, store, max_client
+
+    async def test_reply_quotes_linked_max_message(self, tmp_path):
+        ctx, store, max_client = self._ctx(tmp_path)
+        store.link_tg(300, 42, "115000000000000001")
+        await _on_topic_message(_reply_update(300), ctx)
+        assert max_client.send_message.await_args.kwargs["reply_to"] == "115000000000000001"
+
+    async def test_topic_root_is_not_a_reply(self, tmp_path):
+        ctx, store, max_client = self._ctx(tmp_path)
+        store.link_tg(10, 42, "1")
+        await _on_topic_message(_reply_update(10, thread_id=10), ctx)
+        assert max_client.send_message.await_args.kwargs["reply_to"] is None
+
+    async def test_link_from_other_chat_is_ignored(self, tmp_path):
+        ctx, store, max_client = self._ctx(tmp_path)
+        store.link_tg(300, 77, "1")
+        await _on_topic_message(_reply_update(300), ctx)
+        assert max_client.send_message.await_args.kwargs["reply_to"] is None
+
+    async def test_own_sent_message_is_linked(self, tmp_path):
+        ctx, store, _ = self._ctx(tmp_path, resp={"message": {"id": 999}})
+        await _on_topic_message(_reply_update(300, message_id=501), ctx)
+        assert store.max_for_tg(501) == ("42", "999")
+
+
+# ---------------------------------------------------------------------------
+# Telegram edit → MAX edit
+# ---------------------------------------------------------------------------
+
+from app.tg_handler import _on_topic_edit
+
+
+def _edit_update(text="исправлено", thread_id=10, message_id=501):
+    update = MagicMock()
+    update.message = None
+    msg = MagicMock()
+    msg.text = text
+    msg.entities = []
+    msg.message_id = message_id
+    msg.message_thread_id = thread_id
+    msg.is_topic_message = True
+    msg.reply_text = AsyncMock()
+    msg.set_reaction = AsyncMock()
+    update.edited_message = msg
+    update.effective_user = MagicMock()
+    update.effective_user.id = 100
+    return update
+
+
+class TestEditMirror:
+    def _ctx(self, tmp_path, resp=None):
+        store = RecoveryStore(str(tmp_path / "r.sqlite3"))
+        max_client = MagicMock()
+        max_client.edit_message = AsyncMock(return_value=resp or {"message": {"id": 999}})
+        ctx = _make_context(max_client=max_client, topic_store=_make_topic_store({10: 42}))
+        ctx.bot_data[LINK_STORE_KEY] = store
+        return ctx, store, max_client
+
+    async def test_edit_of_own_message_is_mirrored(self, tmp_path):
+        ctx, store, max_client = self._ctx(tmp_path)
+        store.link_tg(501, 42, "999")
+        await _on_topic_edit(_edit_update("исправлено"), ctx)
+        max_client.edit_message.assert_awaited_once_with(42, "999", "исправлено", elements=[])
+
+    async def test_unknown_message_is_ignored(self, tmp_path):
+        ctx, _, max_client = self._ctx(tmp_path)
+        await _on_topic_edit(_edit_update(), ctx)
+        max_client.edit_message.assert_not_awaited()
+
+    async def test_message_from_other_chat_is_ignored(self, tmp_path):
+        ctx, store, max_client = self._ctx(tmp_path)
+        store.link_tg(501, 77, "999")
+        await _on_topic_edit(_edit_update(), ctx)
+        max_client.edit_message.assert_not_awaited()
+
+    async def test_failed_edit_gets_thumbs_down(self, tmp_path):
+        ctx, store, _ = self._ctx(tmp_path, resp={"_max_error": {"message": "nope"}})
+        store.link_tg(501, 42, "999")
+        update = _edit_update()
+        await _on_topic_edit(update, ctx)
+        update.edited_message.set_reaction.assert_awaited_once_with("👎")
+
+    def test_edit_handler_registered_in_own_group(self):
+        app = build_tg_app("123456:AAABBBCCC", MagicMock(), "-100123456", _make_topic_store())
+        assert any(h.callback is _on_topic_edit for h in app.handlers.get(1, []))
+        assert all(h.callback is not _on_topic_edit for h in app.handlers[0])
+
+
+from datetime import timedelta
+from app.tg_handler import _duration_ms
+
+
+class TestDurationMs:
+    def test_int_seconds(self):
+        assert _duration_ms(3) == 3000
+
+    def test_timedelta(self):
+        assert _duration_ms(timedelta(seconds=2.5)) == 2500
+
+    def test_none(self):
+        assert _duration_ms(None) == 0

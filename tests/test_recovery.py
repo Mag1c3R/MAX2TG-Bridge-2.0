@@ -50,3 +50,10 @@ async def test_reconnect_fetches_missed_message_once(tmp_path):
     assert store.get('pending_since') == 0
     assert client.fetch_history.await_count == 2
     await client._on_disconnect_cb()
+
+
+def test_tg_links_roundtrip(tmp_path):
+    store = RecoveryStore(str(tmp_path / 'recovery.sqlite3'))
+    assert store.max_for_tg(1) is None
+    store.link_tg(1, -70, 123456789012345678)
+    assert RecoveryStore(str(tmp_path / 'recovery.sqlite3')).max_for_tg(1) == ('-70', '123456789012345678')

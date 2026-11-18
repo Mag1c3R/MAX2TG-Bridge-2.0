@@ -26,6 +26,7 @@ TOPIC_STORE_KEY = "topic_store"
 ALLOWED_USER_KEY = "allowed_user_id"
 SUPERGROUP_KEY = "supergroup_id"
 READ_RECEIPTS_KEY = "read_receipts"
+LINK_STORE_KEY = "link_store"
 
 _MAX_URL_RE = re.compile(r"https?://(?:web\.)?max\.ru/(-?\d+)")
 
@@ -114,10 +115,11 @@ def _peer_id_in_dm(resolver, chat_id) -> int | None:
     return None
 
 
-def _resolve_topic_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def _resolve_topic_target(update: Update, context: ContextTypes.DEFAULT_TYPE, message=None):
     """Common prelude for topic handlers. Returns (message, max_chat_id, max_client)
-    if the message should be routed, or None to drop silently."""
-    message = update.message
+    if the message should be routed, or None to drop silently. Only new messages
+    are routed unless ``message`` (e.g. an edited one) is passed explicitly."""
+    message = message or update.message
     if message is None:
         return None
     thread_id = message.message_thread_id
@@ -199,6 +201,31 @@ async def _track_dm_send(message, resp, max_chat_id, max_client, context) -> Non
         log.warning("Could not track a MAX read receipt", exc_info=True)
 
 
+def _max_reply_target(message, max_chat_id, context) -> str | None:
+    """MAX message id that a Telegram reply in this topic should quote, if known."""
+    reply = message.reply_to_message
+    # In a forum topic every message "replies" to the topic's service message.
+    if reply is None or reply.message_id == message.message_thread_id or reply.forum_topic_created:
+        return None
+    store = context.bot_data.get(LINK_STORE_KEY)
+    found = store.max_for_tg(reply.message_id) if store else None
+    if not found or found[0] != str(max_chat_id):
+        return None
+    return found[1]
+
+
+def _link_sent(message, resp, max_chat_id, context) -> None:
+    """Remember our own sent message so replying to it in Telegram quotes it too."""
+    store = context.bot_data.get(LINK_STORE_KEY)
+    sent = resp.get("message") if isinstance(resp, dict) else None
+    if store is None or not isinstance(sent, dict) or sent.get("id") is None:
+        return
+    try:
+        store.link_tg(message.message_id, max_chat_id, sent["id"])
+    except Exception:
+        log.warning("Could not store TG→MAX message link", exc_info=True)
+
+
 async def _on_topic_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Route a text message typed in a forum topic back to the matching Max chat."""
     target = _resolve_topic_target(update, context)
@@ -214,15 +241,53 @@ async def _on_topic_message(update: Update, context: ContextTypes.DEFAULT_TYPE) 
 
     elements = _entities_to_max_elements(message.text, message.entities)
     try:
-        resp = await max_client.send_message(max_chat_id, message.text,
-                                              elements=elements)
+        resp = await max_client.send_message(
+            max_chat_id, message.text, elements=elements,
+            reply_to=_max_reply_target(message, max_chat_id, context),
+        )
     except Exception:
         log.exception("Failed to send reply to Max chat %s", max_chat_id)
         await _report_send_failure(message, "⚠️ Ошибка при отправке в Max.")
         return
 
     await _surface_send_result(message, resp)
+    _link_sent(message, resp, max_chat_id, context)
     await _track_dm_send(message, resp, max_chat_id, max_client, context)
+
+
+async def _on_topic_edit(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Mirror an edit of our own Telegram message (text or caption) to MAX."""
+    if update.edited_message is None:
+        return
+    target = _resolve_topic_target(update, context, message=update.edited_message)
+    if not target:
+        return
+    message, max_chat_id, max_client = target
+    store = context.bot_data.get(LINK_STORE_KEY)
+    found = store.max_for_tg(message.message_id) if store else None
+    # Only messages we sent into MAX are linked to our own MAX message.
+    if not found or found[0] != str(max_chat_id) or not max_client:
+        return
+    text = message.text if message.text is not None else (message.caption or "")
+    entities = message.entities if message.text is not None else message.caption_entities
+    try:
+        resp = await max_client.edit_message(
+            max_chat_id, found[1], text,
+            elements=_entities_to_max_elements(text, entities),
+        )
+    except Exception:
+        log.exception("Failed to edit message in Max chat %s", max_chat_id)
+        await _report_send_failure(message, "⚠️ Не удалось изменить сообщение в Max.")
+        return
+    await _surface_send_result(message, resp)
+
+
+def _duration_ms(duration) -> int:
+    """Telegram media duration (int seconds, or timedelta in newer PTB) → ms."""
+    if duration is None:
+        return 0
+    seconds = duration.total_seconds() if hasattr(duration, "total_seconds") else duration
+    return int(seconds * 1000)
 
 
 async def _download_tg_file(file_obj) -> bytes | None:
@@ -272,6 +337,17 @@ async def _on_topic_media(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 data, chat_id=max_chat_id,
                 filename="voice.ogg",
                 mimetype="audio/ogg",
+                duration_ms=_duration_ms(message.voice.duration),
+            )
+
+        elif message.video_note:
+            data = await _download_tg_file(message.video_note)
+            if data is None:
+                await _report_send_failure(message, "⚠️ Не удалось скачать кружочек из Telegram.")
+                return
+            attach = await max_client.upload_video_note(
+                data, chat_id=max_chat_id,
+                duration_ms=_duration_ms(message.video_note.duration),
             )
 
         elif message.audio:
@@ -320,15 +396,17 @@ async def _on_topic_media(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     elements = _entities_to_max_elements(caption, message.caption_entities)
     try:
-        resp = await max_client.send_message(max_chat_id, text=caption,
-                                              elements=elements,
-                                              attaches=[attach])
+        resp = await max_client.send_message(
+            max_chat_id, text=caption, elements=elements, attaches=[attach],
+            reply_to=_max_reply_target(message, max_chat_id, context),
+        )
     except Exception:
         log.exception("Failed to send media reply to Max chat %s", max_chat_id)
         await _report_send_failure(message, "⚠️ Ошибка при отправке в Max.")
         return
 
     await _surface_send_result(message, resp)
+    _link_sent(message, resp, max_chat_id, context)
     await _track_dm_send(message, resp, max_chat_id, max_client, context)
 
 
@@ -959,7 +1037,8 @@ async def _cmd_profile(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 def build_tg_app(token: str, max_client: MaxClient, supergroup_id: str,
                  topic_store: TopicStore, allowed_user_id: int | None = None,
                  proxy_url: str | None = None,
-                 read_receipts: ReadReceiptStore | None = None) -> Application:
+                 read_receipts: ReadReceiptStore | None = None,
+                 link_store=None) -> Application:
     """Build the Telegram Application that routes topic replies back to Max."""
     builder = Application.builder().token(token)
     if proxy_url:
@@ -970,6 +1049,7 @@ def build_tg_app(token: str, max_client: MaxClient, supergroup_id: str,
     app.bot_data[ALLOWED_USER_KEY] = int(allowed_user_id) if allowed_user_id else None
     app.bot_data[SUPERGROUP_KEY] = int(supergroup_id)
     app.bot_data[READ_RECEIPTS_KEY] = read_receipts
+    app.bot_data[LINK_STORE_KEY] = link_store
 
     chat_filter = filters.Chat(chat_id=int(supergroup_id))
     app.add_handler(CommandHandler("bind", _cmd_bind, filters=chat_filter))
@@ -984,10 +1064,16 @@ def build_tg_app(token: str, max_client: MaxClient, supergroup_id: str,
     )
     media_filter = (
         filters.PHOTO | filters.VOICE | filters.AUDIO
-        | filters.Document.ALL | filters.VIDEO
+        | filters.Document.ALL | filters.VIDEO | filters.VIDEO_NOTE
     )
     app.add_handler(
         MessageHandler(media_filter & chat_filter, _on_topic_media)
+    )
+    # Own group: the text/media handlers above also match edited updates and
+    # would otherwise stop dispatch before this one is reached.
+    app.add_handler(
+        MessageHandler(filters.UpdateType.EDITED_MESSAGE & ~filters.COMMAND & chat_filter, _on_topic_edit),
+        group=1,
     )
 
     return app

@@ -1,19 +1,160 @@
 import asyncio
+import base64
 import json
 import logging
 import os
 import random
+import struct
 import time
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Any
 
 import aiohttp
+import msgpack
 
 log = logging.getLogger(__name__)
 
 DEBUG_DIR = "debug"
+
+# ── binary frame codec (web client protocol v10, since Nov 2026) ──
+#
+# Frame = 10-byte header + msgpack payload:
+#   u8 proto version (10) | u8 cmd | i16 seq | i16 opcode
+#   u8 compression factor (0 = none, else payload is a raw LZ4 block and
+#      decompressed size <= len * factor) | u24 payload length
+# msgpack ext type 1 carries int64 values (ids) as a nested msgpack int.
+
+PROTO_VER = 10
+APP_VERSION = "26.11.9"
+_HEADER = struct.Struct(">BBhhB")
+HEADER_LEN = 10
+MAX_SEQ = 32767
+_EXT_BIGINT = 1
+
+
+def _lz4_block_decompress(src: bytes, max_size: int) -> bytes:
+    """Decode a raw LZ4 block (no frame header)."""
+    dst = bytearray()
+    i, n = 0, len(src)
+    while i < n:
+        token = src[i]
+        i += 1
+        lit = token >> 4
+        if lit == 15:
+            while True:
+                b = src[i]
+                i += 1
+                lit += b
+                if b != 255:
+                    break
+        dst += src[i:i + lit]
+        i += lit
+        if i >= n:
+            break  # last sequence has literals only
+        offset = src[i] | (src[i + 1] << 8)
+        i += 2
+        mlen = (token & 15) + 4
+        if (token & 15) == 15:
+            while True:
+                b = src[i]
+                i += 1
+                mlen += b
+                if b != 255:
+                    break
+        start = len(dst) - offset
+        if offset == 0 or start < 0 or len(dst) + mlen > max_size:
+            raise ValueError("corrupt LZ4 block")
+        if offset >= mlen:
+            dst += dst[start:start + mlen]
+        else:  # overlapping match repeats the tail
+            for k in range(mlen):
+                dst.append(dst[start + k])
+    return bytes(dst)
+
+
+def _ext_hook(code: int, data: bytes):
+    if code == _EXT_BIGINT:
+        return msgpack.unpackb(data)
+    return msgpack.ExtType(code, data)
+
+
+def _str_keys(pairs):
+    # The web client sees maps as JS objects, so numeric keys become strings;
+    # keep that so payload["<chatId>"] lookups behave as with the old JSON API.
+    return {k if isinstance(k, str) else str(k): v for k, v in pairs}
+
+
+def encode_frame(cmd: int, seq: int, opcode: int, payload: Any) -> bytes:
+    body = b"" if payload is None else msgpack.packb(payload, use_bin_type=True)
+    n = len(body)
+    return _HEADER.pack(PROTO_VER, cmd, seq, opcode, 0) + n.to_bytes(3, "big") + body
+
+
+def decode_frame(raw: bytes) -> dict:
+    ver, cmd, seq, opcode, factor = _HEADER.unpack_from(raw)
+    if ver != PROTO_VER:
+        log.warning("Unexpected proto version %d for op=%d", ver, opcode)
+    n = int.from_bytes(raw[7:10], "big")
+    frame = {"cmd": cmd, "seq": seq, "opcode": opcode, "payload": {}}
+    if n <= 0:
+        return frame
+    body = raw[HEADER_LEN:HEADER_LEN + n]
+    if len(body) != n:
+        raise ValueError(f"frame length mismatch: header={n} actual={len(body)}")
+    if factor > 0:
+        body = _lz4_block_decompress(body, n * factor)
+    frame["payload"] = msgpack.unpackb(
+        body, raw=False, strict_map_key=False,
+        ext_hook=_ext_hook, object_pairs_hook=_str_keys,
+    )
+    return frame
+
+
+WAVE_BARS = 80
+WAVE_MAX = 127
+
+
+def ogg_waveform(data: bytes, bars: int = WAVE_BARS) -> bytes:
+    """Rough voice waveform for a MAX AUDIO attach, without decoding audio.
+
+    MAX rejects voice attaches that lack a wave (with a misleading
+    "video.not.supported"). Telegram voice notes are Ogg/Opus, where each
+    packet covers ~20 ms and its byte size grows with loudness, so packet
+    sizes bucketed into ``bars`` columns and scaled to 0..127 give a usable
+    shape. Falls back to a flat wave if the container can't be parsed.
+    """
+    sizes: list[int] = []
+    pos, cur = 0, 0
+    while pos + 27 <= len(data) and data[pos:pos + 4] == b"OggS":
+        nseg = data[pos + 26]
+        lacing = data[pos + 27:pos + 27 + nseg]
+        pos += 27 + nseg
+        for lace in lacing:
+            cur += lace
+            if lace < 255:  # packet ends on a segment shorter than 255
+                sizes.append(cur)
+                cur = 0
+        pos += sum(lacing)
+    sizes = sizes[2:]  # OpusHead + OpusTags
+    if not sizes:
+        return bytes([WAVE_MAX // 4]) * bars
+    step = len(sizes) / bars
+    cols = []
+    for i in range(bars):
+        chunk = sizes[int(i * step):max(int((i + 1) * step), int(i * step) + 1)]
+        cols.append(sum(chunk) / len(chunk) if chunk else 0)
+    lo, hi = min(cols), max(cols)
+    if hi - lo < 1e-9:
+        return bytes([WAVE_MAX // 4]) * bars
+    return bytes(int((c - lo) / (hi - lo) * WAVE_MAX) for c in cols)
+
+
+def profile_contact(snapshot: dict) -> dict:
+    """AUTH_SNAPSHOT profile; since Nov 2026 the user data sits under profile.contact."""
+    profile = snapshot.get("profile") or {}
+    return profile.get("contact") or profile
 
 
 def _log_task_exception(task: "asyncio.Task") -> None:
@@ -74,6 +215,7 @@ class OpCode(IntEnum):
     ATTACH_TYPING = 65        # "I'm uploading <type> in this chat"
     EDIT_MESSAGE = 67
     PHOTO_UPLOAD_URL = 80     # get URL for photo upload
+    MEDIA_UPLOAD_URL = 82     # slot for direct voice (type 2) / video note (type 1) upload
     VIDEO_PLAY = 83           # resolve a video attachment to an MP4 URL
     AUDIO_UPLOAD_URL = 86     # get URL for voice/audio upload (experimental)
     FILE_UPLOAD_URL = 87      # get URL for file upload
@@ -97,7 +239,7 @@ class MaxMessage:
 
 
 class MaxClient:
-    WS_URL = "wss://ws-api.oneme.ru/websocket"
+    WS_URL = "wss://api.oneme.ru/websocket"
     HEARTBEAT_SEC = 30
     RECONNECT_SEC = 5
 
@@ -107,6 +249,7 @@ class MaxClient:
         self.debug = debug
         self._ws: aiohttp.ClientWebSocketResponse | None = None
         self._seq = 0
+        self._last_in_seq = 0
         self._my_id = None
         self._on_ready_cb = None
         self._on_message_cb = None
@@ -140,21 +283,22 @@ class MaxClient:
 
     # ── transport ──────────────────────────────────────────────────
 
-    async def _send(self, opcode: int, payload: dict) -> int:
+    async def _send(self, opcode: int, payload: dict | None, cmd: int = 0, seq: int | None = None) -> int:
+        """Send a frame. With seq=None a new request seq is allocated; pass the
+        server's seq (and cmd=1) to acknowledge a server-initiated event."""
         if not self._ws or self._ws.closed:
             return -1
-        seq = self._seq
-        pkt = {
-            "ver": 11,
-            "cmd": 0,
-            "seq": seq,
-            "opcode": opcode,
-            "payload": payload,
-        }
-        self._seq += 1
-        raw = json.dumps(pkt, ensure_ascii=False)
-        log.debug(">>> SEND op=%d seq=%d | %s", opcode, seq, raw[:800])
-        await self._ws.send_str(raw)
+        if seq is None:
+            seq = self._seq
+            if seq >= MAX_SEQ:
+                # seq is int16 on the wire — the web client reconnects here too
+                log.info("seq limit reached, reconnecting")
+                await self._ws.close()
+                return -1
+            self._seq += 1
+        log.debug(">>> SEND op=%d cmd=%d seq=%d | %s", opcode, cmd, seq,
+                  json.dumps(payload, ensure_ascii=False, default=str)[:800])
+        await self._ws.send_bytes(encode_frame(cmd, seq, opcode, payload))
         return seq
 
     async def cmd(self, opcode: int, payload: dict, timeout: float = 10) -> dict:
@@ -199,18 +343,27 @@ class MaxClient:
                     ) as ws:
                         self._ws = ws
                         self._seq = 0
+                        self._last_in_seq = 0
                         self._pending.clear()
 
                         log.info("Connected. Sending handshake...")
                         await self._send(
                             OpCode.HANDSHAKE,
                             {
-                                "deviceId": self.device_id,
                                 "userAgent": {
                                     "deviceType": "WEB",
-                                    "deviceName": "Chrome 131.0.0.0",
+                                    "locale": "ru",
+                                    "deviceLocale": "ru",
+                                    "osVersion": "Windows 10.0",
+                                    "deviceName": "Google Chrome 131.0.0.0",
+                                    "headerUserAgent": _USER_AGENT,
+                                    "isPwa": False,
+                                    "appVersion": APP_VERSION,
+                                    "screen": "1080x1920 1.0x",
+                                    "timezone": "Europe/Moscow",
                                 },
-                                "appVersion": "26.2.2",
+                                "deviceId": self.device_id,
+                                "clientSessionId": int(time.time() * 1000),
                             },
                         )
 
@@ -219,8 +372,15 @@ class MaxClient:
                         )
 
                         async for msg in ws:
-                            if msg.type == aiohttp.WSMsgType.TEXT:
-                                await self._handle(json.loads(msg.data))
+                            if msg.type == aiohttp.WSMsgType.BINARY:
+                                try:
+                                    frame = decode_frame(msg.data)
+                                except Exception:
+                                    log.exception("Bad frame (%d bytes): %s", len(msg.data), msg.data[:16].hex())
+                                    continue
+                                await self._handle(frame)
+                            elif msg.type == aiohttp.WSMsgType.TEXT:
+                                log.warning("Unexpected text frame: %s", msg.data[:300])
                             elif msg.type in (
                                 aiohttp.WSMsgType.CLOSED,
                                 aiohttp.WSMsgType.ERROR,
@@ -259,7 +419,24 @@ class MaxClient:
         op = data.get("opcode")
         cmd = data.get("cmd")
         seq = data.get("seq")
-        payload = data.get("payload", {})
+        payload = data.get("payload") or {}
+
+        if cmd == 0:
+            # Server-initiated: drop redeliveries, answer pings, ack messages
+            # (mirrors the web client; unacked events get resent).
+            if seq <= self._last_in_seq:
+                return
+            self._last_in_seq = seq
+            if op == OpCode.HEARTBEAT_PING:
+                await self._send(OpCode.HEARTBEAT_PING, None, cmd=1, seq=seq)
+                return
+            if op == OpCode.DISPATCH:
+                await self._send(
+                    OpCode.DISPATCH,
+                    {"chatId": payload.get("chatId"),
+                     "messageId": (payload.get("message") or {}).get("id")},
+                    cmd=1, seq=seq,
+                )
 
         # cmd=1 is a response to our request — resolve the pending future
         if cmd == 1 and seq in self._pending:
@@ -278,7 +455,7 @@ class MaxClient:
 
         # server-initiated events — not a reply to one of our requests
         else:
-            payload_preview = json.dumps(payload, ensure_ascii=False)
+            payload_preview = json.dumps(payload, ensure_ascii=False, default=str)
             if len(payload_preview) > 3000:
                 payload_preview = payload_preview[:3000] + "…"
 
@@ -294,7 +471,7 @@ class MaxClient:
                 )
 
             elif op == OpCode.AUTH_SNAPSHOT and cmd == 1:
-                self._my_id = payload.get("profile", {}).get("id")
+                self._my_id = profile_contact(payload).get("id")
                 log.info("Authorized! my_id=%s", self._my_id)
                 if self.debug:
                     self._dump_json("snapshot.json", payload)
@@ -364,12 +541,13 @@ class MaxClient:
         return self._parse_message({"chatId": chat_id, "message": message})
 
     async def send_message(self, chat_id, text: str = "", elements=None,
-                            attaches=None) -> dict:
+                            attaches=None, reply_to=None) -> dict:
         """Send a message to a Max chat. Returns the server response.
 
         Both ``elements`` (text formatting) and ``attaches`` (photos, files,
         voice, ...) are optional. Pass an empty ``text`` together with an
-        attach to send a media-only message.
+        attach to send a media-only message. ``reply_to`` is a MAX message id
+        to quote (a reply within the same chat).
         """
         if elements is None:
             elements = []
@@ -379,6 +557,9 @@ class MaxClient:
         message = {"text": text, "cid": cid, "elements": elements}
         if attaches:
             message["attaches"] = attaches
+        if reply_to:
+            mid = str(reply_to)
+            message["link"] = {"type": "REPLY", "messageId": int(mid) if mid.isdigit() else mid}
         resp = await self.cmd(
             OpCode.SEND_MESSAGE,
             {
@@ -388,8 +569,24 @@ class MaxClient:
             },
         )
         ok = bool(resp) and "_max_error" not in resp
-        log.info("send_message(chat=%s, attaches=%d) → %s",
-                 chat_id, len(attaches), "OK" if ok else "FAIL")
+        log.info("send_message(chat=%s, attaches=%d, reply_to=%s) → %s",
+                 chat_id, len(attaches), reply_to, "OK" if ok else "FAIL")
+        return resp
+
+    async def edit_message(self, chat_id, message_id, text: str, elements=None) -> dict:
+        """Edit the text of one of our messages; attachments stay as they are."""
+        mid = str(message_id)
+        resp = await self.cmd(
+            OpCode.EDIT_MESSAGE,
+            {
+                "chatId": chat_id,
+                "messageId": int(mid) if mid.isdigit() else mid,
+                "text": text,
+                "elements": elements or [],
+            },
+        )
+        ok = bool(resp) and "_max_error" not in resp
+        log.info("edit_message(chat=%s, msg=%s) → %s", chat_id, message_id, "OK" if ok else "FAIL")
         return resp
 
     # ── media upload ───────────────────────────────────────────────
@@ -454,7 +651,7 @@ class MaxClient:
             payload = {
                 "audioId": int(audio_id),
                 "chatId": int(chat_id),
-                "messageId": str(message_id),
+                "messageId": int(message_id),  # int64 in the v10 protocol
             }
         except (TypeError, ValueError):
             return None
@@ -474,7 +671,7 @@ class MaxClient:
             payload = {
                 "videoId": int(video_id),
                 "chatId": int(chat_id),
-                "messageId": str(message_id),
+                "messageId": int(message_id),  # int64 in the v10 protocol
             }
         except (TypeError, ValueError):
             return None
@@ -506,22 +703,63 @@ class MaxClient:
             host.endswith(".oneme.ru") or host.endswith(".okcdn.ru")
         )
 
+    async def _media_upload_slot(self, media_type: int) -> dict | None:
+        """MEDIA_UPLOAD_URL (opcode 82) → {videoId, token, url} for direct upload."""
+        resp = await self.cmd(OpCode.MEDIA_UPLOAD_URL,
+                              {"count": 1, "type": media_type, "uploaderType": 1})
+        info = (resp or {}).get("info") or []
+        slot = info[0] if info and isinstance(info[0], dict) else None
+        if not slot or not slot.get("url") or slot.get("videoId") is None:
+            log.error("Media upload slot request failed (type=%d): %s", media_type, resp)
+            return None
+        return slot
+
     async def upload_audio(self, data: bytes, chat_id=None,
                             filename: str = "voice.ogg",
                             mimetype: str = "audio/ogg",
+                            duration_ms: int = 0,
                             timeout: float = 60.0) -> dict | None:
-        """Upload a voice / audio message.
+        """Upload an OGG/Opus voice note; returns a native AUDIO attach.
 
-        Known limitation: MAX stores audio in a different namespace from
-        regular files; ``fileId`` from the file-upload path is rejected by
-        the audio service ("EJB service unavailable"). Until we figure out
-        the dedicated audio-upload endpoint, voice arrives in MAX as an
-        ``.ogg`` file rather than a voice bubble.
+        Mirrors the web client: an opcode-82 slot (type 2), then a raw POST
+        of the .ogg to the slot URL. ``.ogg`` uploads are direct, so the
+        attach is usable as soon as the POST succeeds.
         """
-        return await self.upload_file(
-            data, chat_id=chat_id, filename=filename, mimetype=mimetype,
-            attach_type="FILE", timeout=timeout,
-        )
+        if chat_id is not None:
+            await self.cmd(OpCode.ATTACH_TYPING, {"chatId": chat_id, "type": "AUDIO"})
+        slot = await self._media_upload_slot(2)
+        if not slot:
+            return None
+        if await self._raw_upload(slot["url"], data, filename, content_range=True) is None:
+            return None
+        return {"_type": "AUDIO", "audioId": slot["videoId"],
+                "duration": int(duration_ms), "wave": ogg_waveform(data),
+                "token": slot.get("token")}
+
+    async def upload_video_note(self, data: bytes, chat_id=None,
+                                 duration_ms: int = 0) -> dict | None:
+        """Upload a round video message; returns a VIDEO attach with videoType=1.
+
+        Opcode-82 slot (type 1), then the web client's
+        "video-message-direct" POST, whose JSON reply must carry a thumbhash.
+        """
+        if chat_id is not None:
+            await self.cmd(OpCode.ATTACH_TYPING, {"chatId": chat_id, "type": "VIDEO_MSG"})
+        slot = await self._media_upload_slot(1)
+        if not slot:
+            return None
+        body = await self._raw_upload(slot["url"], data, "video_note.mp4", content_range=False)
+        thumbhash = (body or {}).get("thumbhash")
+        if not thumbhash:
+            log.error("Video note upload returned no thumbhash: %s", body)
+            return None
+        try:
+            thumbhash_bytes = base64.b64decode(thumbhash)
+        except (ValueError, TypeError):
+            log.error("Video note upload returned a bad thumbhash: %r", thumbhash)
+            return None
+        return {"_type": "VIDEO", "videoId": slot["videoId"], "token": slot.get("token"),
+                "videoType": 1, "duration": int(duration_ms), "thumbhash": thumbhash_bytes}
 
     async def upload_file(self, data: bytes, chat_id=None,
                            filename: str = "file.bin",
@@ -614,6 +852,49 @@ class MaxClient:
             if close_after:
                 await session.close()
 
+    async def _raw_upload(self, url: str, data: bytes, filename: str,
+                           content_range: bool) -> dict | None:
+        """POST raw bytes (not multipart) to a media upload URL.
+
+        Returns the parsed JSON reply ({} when the body is empty or not JSON)
+        on HTTP 200/201, or None on error.
+        """
+        session = getattr(self, "_session", None)
+        close_after = False
+        if session is None or session.closed:
+            session = aiohttp.ClientSession(headers=_BROWSER_HEADERS)
+            close_after = True
+        headers = {
+            **_HTTP_HEADERS,
+            "Content-Type": "application/octet-stream",
+            "Content-Disposition": f"attachment; filename={quote(filename)}",
+        }
+        if content_range:
+            headers["Content-Range"] = f"bytes 0-{len(data) - 1}/{len(data)}"
+        try:
+            async with session.post(
+                url, headers=headers, data=data,
+                timeout=aiohttp.ClientTimeout(total=120),
+            ) as resp:
+                text = await resp.text()
+                if resp.status not in (200, 201):
+                    log.error("Raw upload failed: HTTP %d — %s", resp.status, text[:500])
+                    return None
+                try:
+                    body = json.loads(text) if text.strip() else {}
+                except ValueError:
+                    body = {}
+                if isinstance(body, dict) and "error_code" in body:
+                    log.error("Raw upload rejected: %s", text[:500])
+                    return None
+                return body if isinstance(body, dict) else {}
+        except Exception:
+            log.exception("Raw upload error at %s", urlparse(url).hostname)
+            return None
+        finally:
+            if close_after:
+                await session.close()
+
     async def download_file(self, url: str) -> bytes | None:
         """Download a file by URL, returning raw bytes or None on failure."""
         session = getattr(self, "_session", None)
@@ -668,7 +949,7 @@ class MaxClient:
         path = os.path.join(DEBUG_DIR, filename)
         try:
             with open(path, "w", encoding="utf-8") as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+                json.dump(data, f, ensure_ascii=False, indent=2, default=str)
             log.info("Dumped %s (%d bytes)", path, os.path.getsize(path))
         except Exception:
             log.exception("Failed to dump %s", path)

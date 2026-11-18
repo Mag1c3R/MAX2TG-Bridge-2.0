@@ -37,6 +37,10 @@ class TelegramSender:
         self._topics = topic_store
         self._topic_lock = asyncio.Lock()
         self.require_success = contextvars.ContextVar("require_telegram_success", default=False)
+        # (max_chat_id, max_message_id) being forwarded; every Telegram message sent
+        # meanwhile is linked to it so a Telegram reply can quote it in MAX.
+        self.max_origin = contextvars.ContextVar("max_origin", default=None)
+        self.link_store = None  # RecoveryStore, set by main
 
     @property
     def bot(self) -> Bot:
@@ -112,12 +116,28 @@ class TelegramSender:
             return text[: TG_CAPTION_MAX - 20] + "\n\n[...усечено]"
         return text
 
+    def _link_sent(self, result) -> None:
+        origin = self.max_origin.get()
+        if not origin or self.link_store is None:
+            return
+        for sent in result if isinstance(result, (list, tuple)) else (result,):
+            tg_id = getattr(sent, "message_id", None)
+            if tg_id is None:
+                continue
+            try:
+                self.link_store.link_tg(tg_id, *origin)
+            except Exception:
+                # A lost link only disables quoting for this message.
+                log.warning("Could not store TG→MAX message link", exc_info=True)
+
     async def _retry(self, coro_factory, strict: bool | None = None):
         if strict is None:
             strict = self.require_success.get()
         for attempt in range(1, MAX_RETRIES + 1):
             try:
-                return await coro_factory()
+                result = await coro_factory()
+                self._link_sent(result)
+                return result
             except RetryAfter as e:
                 log.warning("Telegram rate limit, retry after %ss", e.retry_after)
                 await asyncio.sleep(e.retry_after)

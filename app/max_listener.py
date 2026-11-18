@@ -73,6 +73,8 @@ async def _send_attach(
             url = await client.download_audio_url(
                 audio_id, chat_id, message_id, token=token,
             )
+        # Fall back to the URL MAX now ships inside the attach itself.
+        url = url or attach.get("url")
         if url:
             data = await client.download_file(url)
             if data:
@@ -418,7 +420,9 @@ def create_max_client(
 
     @client.on_read_mark
     async def handle_read_mark(payload: dict):
-        if read_receipts is None or payload.get("setAsUnread") is not False:
+        # setAsUnread is optional in the v10 protocol; absent means a real read
+        # (as in the web client). True is someone marking a chat unread.
+        if read_receipts is None or payload.get("setAsUnread"):
             return
         try:
             chat_id = int(payload["chatId"])
@@ -525,12 +529,14 @@ def create_max_client(
             if recovery and msg.message_id and recovery.seen(msg.chat_id, msg.message_id):
                 return False
             token = sender.require_success.set(True)
+            origin = sender.max_origin.set((msg.chat_id, msg.message_id) if msg.message_id else None)
             try:
                 await _forward_message(msg)
                 if recovery and msg.message_id:
                     recovery.mark(msg.chat_id, msg.message_id)
                 return True
             finally:
+                sender.max_origin.reset(origin)
                 sender.require_success.reset(token)
 
     return client

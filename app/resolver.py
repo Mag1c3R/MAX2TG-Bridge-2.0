@@ -5,6 +5,8 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any
 
+from app.max_client import profile_contact
+
 if TYPE_CHECKING:
     from app.max_client import MaxClient
 
@@ -57,7 +59,7 @@ class ContactResolver:
     # ── populate from AUTH_SNAPSHOT ────────────────────────────────
 
     def load_snapshot(self, snapshot: dict) -> list:
-        profile = snapshot.get("profile", {})
+        profile = profile_contact(snapshot)
         self._my_id = profile.get("id")
         names = profile.get("names", [])
         if names and self._my_id:
