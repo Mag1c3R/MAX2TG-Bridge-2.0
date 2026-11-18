@@ -13,7 +13,7 @@
 При создании топика автоматически постится и закрепляется карточка собеседника с именем, id и аватаром.
 
 <p align="center">
-  <img src="docs/infographic.png" alt="Как работает MAX2TG-Bridge" width="720"/>
+  <img src="docs/infographic.png" alt="Как работает MAX2TG-Bridge 2.0" width="720"/>
 </p>
 
 ---
