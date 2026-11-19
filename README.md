@@ -4,7 +4,7 @@
 
 # MAX2TG-Bridge 2.0
 
-[![tests](https://github.com/Mag1c3R/MAX2TG-Bridge-2.0/actions/workflows/tests.yml/badge.svg)](https://github.com/Mag1c3R/MAX2TG-Bridge-2.0/actions/workflows/tests.yml) [![docker](https://github.com/Mag1c3R/MAX2TG-Bridge-2.0/actions/workflows/docker.yml/badge.svg)](https://github.com/Mag1c3R/MAX2TG-Bridge-2.0/pkgs/container/max2tg-bridge-2.0) [![release](https://img.shields.io/github/v/release/Mag1c3R/MAX2TG-Bridge-2.0)](https://github.com/Mag1c3R/MAX2TG-Bridge-2.0/releases) [![license](https://img.shields.io/github/license/Mag1c3R/MAX2TG-Bridge-2.0)](LICENSE)
+[![release](https://img.shields.io/github/v/release/Mag1c3R/MAX2TG-Bridge-2.0)](https://github.com/Mag1c3R/MAX2TG-Bridge-2.0/releases) [![license](https://img.shields.io/github/license/Mag1c3R/MAX2TG-Bridge-2.0)](LICENSE)
 
 **MAX2TG-Bridge 2.0 by [Mag1c3R](https://github.com/Mag1c3R)** — основан на [ircitdev/MAX2TG-Bridge](https://github.com/ircitdev/MAX2TG-Bridge). Что изменилось по сравнению с ним — в разделе [Что нового в 2.0](#что-нового-в-20) и в [CHANGELOG](CHANGELOG.md).
 
@@ -165,21 +165,6 @@
 
 ### 3. Деплой (Docker, рекомендованный)
 
-Готовый образ (`linux/amd64`, `linux/arm64`) публикуется в GitHub Container Registry:
-
-```bash
-mkdir max2tg && cd max2tg
-curl -fsSLo .env https://raw.githubusercontent.com/Mag1c3R/MAX2TG-Bridge-2.0/main/.env.example
-# отредактируйте .env
-docker run -d --name max2tg --restart unless-stopped --env-file .env \
-  -e STATE_DIR=/app/state -e LOG_DIR=/app/logs \
-  -v "$PWD/state:/app/state" -v "$PWD/logs:/app/logs" \
-  ghcr.io/mag1c3r/max2tg-bridge-2.0:latest
-docker logs -f max2tg
-```
-
-Или собрать из исходников:
-
 ```bash
 git clone https://github.com/Mag1c3R/MAX2TG-Bridge-2.0.git max2tg
 cd max2tg
@@ -286,7 +271,7 @@ pip install pytest pytest-asyncio
 pytest -q
 ```
 
-Покрытие: `app/topics.py` (TopicStore), `app/config.py` (загрузка env), `app/max_listener.py` (форматирование, throttle), `app/tg_handler.py` (роутинг команд, медиа, ответы, правки, `/rm`), `app/max_client.py` (опкоды, бинарный кодек протокола v10, загрузка голосовых и кружочков), `app/max_version.py`, `app/recovery.py`. 257 тестов, запускаются в GitHub Actions на каждый push.
+Покрытие: `app/topics.py` (TopicStore), `app/config.py` (загрузка env), `app/max_listener.py` (форматирование, throttle), `app/tg_handler.py` (роутинг команд, медиа, ответы, правки, `/rm`), `app/max_client.py` (опкоды, бинарный кодек протокола v10, загрузка голосовых и кружочков), `app/max_version.py`, `app/recovery.py`. 257 тестов.
 
 ### Структура проекта
 

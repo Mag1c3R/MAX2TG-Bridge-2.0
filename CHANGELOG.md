@@ -33,4 +33,4 @@ MAX2TG-Bridge 2.0 by Mag1c3R, based on [ircitdev/MAX2TG-Bridge](https://github.c
 
 ### Проект
 - Новые обложка и инфографика, раздел «Что нового в 2.0» в README.
-- 257 тестов, CI на GitHub Actions, Docker-образ в GHCR (`amd64`, `arm64`).
+- 257 тестов.
